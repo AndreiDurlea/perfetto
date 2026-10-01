@@ -276,6 +276,17 @@ PERFETTO_SDK_EXPORT bool PerfettoDsSetBufferExhaustedPolicyConfigurable(
     struct PerfettoDsImpl*,
     bool configurable);
 
+// If `supports` is true (false by default), an instance of the data source
+// gets a tracing v2 writer when its config selects v2.
+// The data source must then start every packet with
+// PerfettoDsTracerImplPacketBeginWithEncoding().
+//
+// Should not be called after PerfettoDsImplRegister().
+//
+// Returns true if successful, false otherwise.
+PERFETTO_SDK_EXPORT bool PerfettoDsSetSupportsTracingV2(struct PerfettoDsImpl*,
+                                                        bool supports);
+
 // Registers the `*ds_impl` data source type.
 //
 // `ds_impl` must be obtained via a call to `PerfettoDsImplCreate()`.
@@ -373,9 +384,35 @@ PERFETTO_SDK_EXPORT void PerfettoDsImplTraceIterateBreak(
     struct PerfettoDsImpl* ds_impl,
     struct PerfettoDsImplTracerIterator* iterator);
 
+// The result of PerfettoDsTracerImplPacketBeginWithEncoding().
+struct PerfettoDsPacketBeginResult {
+  // The stream writer for the packet.
+  struct PerfettoStreamWriter writer;
+  // The encoding of the packet, which is a `enum PerfettoPbMsgEncoding`.
+  // A tracing v2 writer uses the append-only format, and a v1 writer uses
+  // standard protobuf.
+  uint32_t encoding;
+};
+
+// Creates a new trace packet on the tracer.
+// Returns a stream writer for the packet, and the encoding of the packet.
+//
+// - Pass the encoding to PerfettoPbMsgInitWithEncoding() for the root message,
+//   and nested messages take it from the root.
+// - The caller must use PerfettoDsTracerImplPacketEnd() when done.
+PERFETTO_SDK_EXPORT struct PerfettoDsPacketBeginResult
+PerfettoDsTracerImplPacketBeginWithEncoding(struct PerfettoDsTracerImpl*);
+
 // Creates a new trace packet on `tracer`. Returns a stream writer that can be
 // used to write data to the packet. The caller must use
 // PerfettoDsTracerImplPacketEnd() when done.
+//
+// The packet is always length-delimited, so this function aborts on a tracing
+// v2 writer.
+// It stays for clients built with older headers, which never opt in and so
+// never get a tracing v2 writer.
+// A data source that supports tracing v2 must use
+// PerfettoDsTracerImplPacketBeginWithEncoding().
 PERFETTO_SDK_EXPORT struct PerfettoStreamWriter PerfettoDsTracerImplPacketBegin(
     struct PerfettoDsTracerImpl* tracer);
 

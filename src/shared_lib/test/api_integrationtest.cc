@@ -24,8 +24,11 @@
 #include <thread>
 #include <vector>
 
+#include "perfetto/base/build_config.h"
 #include "perfetto/base/time.h"
+#include "perfetto/ext/base/file_utils.h"
 #include "perfetto/ext/base/flags.h"
+#include "perfetto/ext/base/temp_file.h"
 #include "perfetto/public/abi/atomic.h"
 #include "perfetto/public/abi/backend_type.h"
 #include "perfetto/public/abi/data_source_abi.h"
@@ -62,6 +65,10 @@
 #include "src/shared_lib/test/protos/extensions.pzc.h"
 #include "src/shared_lib/test/protos/test_messages.pzc.h"
 #include "src/shared_lib/test/utils.h"
+
+#if PERFETTO_BUILDFLAG(PERFETTO_IPC)
+#include "test/test_helper.h"
+#endif
 
 // Tests for the perfetto shared library.
 
@@ -834,9 +841,12 @@ TEST_F(SharedLibProtozeroSerializationTest, ProtoGroupIncrementalPackedAborts) {
 
 class SharedLibDataSourceTest : public testing::Test {
  protected:
+  virtual uint32_t backend() const { return PERFETTO_BACKEND_IN_PROCESS; }
+  virtual uint32_t shmem_size_hint_kb() const { return 0; }
   void SetUp() override {
     struct PerfettoProducerInitArgs args = PERFETTO_PRODUCER_INIT_ARGS_INIT();
-    args.backends = PERFETTO_BACKEND_IN_PROCESS;
+    args.backends = backend();
+    args.shmem_size_hint_kb = shmem_size_hint_kb();
     PerfettoProducerInit(args);
     PerfettoDsRegister(&data_source_1, kDataSourceName1,
                        PerfettoDsParamsDefault());
@@ -953,6 +963,294 @@ class SharedLibDataSourceTest : public testing::Test {
   NiceMock<MockDs2Callbacks> ds2_callbacks_;
   void* ds2_user_arg_ = kDataSource2UserArg;
 };
+
+// The packet encoding that a tracing v2 writer and a v1 writer give.
+constexpr uint32_t kV2Encoding = PERFETTO_PB_MSG_ENCODING_PROTO_GROUP;
+constexpr uint32_t kV1Encoding = PERFETTO_PB_MSG_ENCODING_LENGTH_DELIMITED;
+
+#if PERFETTO_BUILDFLAG(PERFETTO_IPC) &&                   \
+    (PERFETTO_BUILDFLAG(PERFETTO_OS_LINUX_BUT_NOT_QNX) || \
+     PERFETTO_BUILDFLAG(PERFETTO_OS_ANDROID))
+constexpr char kLegacyDataSourceName[] = "dev.perfetto.legacy_data_source";
+
+// Registers |ds| like a client built with headers from before tracing v2.
+// Such a client never calls PerfettoDsSetSupportsTracingV2(), so do not add
+// that call here.
+bool LegacyClientRegister(PerfettoDs* ds,
+                          const char* name,
+                          PerfettoDsOnStartCb on_start,
+                          void* user_arg) {
+  PerfettoPbMsgWriter writer;
+  PerfettoHeapBuffer* heap = PerfettoHeapBufferCreate(&writer.writer);
+  perfetto_protos_DataSourceDescriptor descriptor;
+  PerfettoPbMsgInit(&descriptor.msg, &writer);
+  perfetto_protos_DataSourceDescriptor_set_cstr_name(&descriptor, name);
+  perfetto_protos_DataSourceDescriptor_set_will_notify_on_stop(&descriptor,
+                                                               true);
+  std::vector<uint8_t> bytes(
+      PerfettoStreamWriterGetWrittenSize(&writer.writer));
+  PerfettoHeapBufferCopyInto(heap, &writer.writer, bytes.data(), bytes.size());
+  PerfettoHeapBufferDestroy(heap, &writer.writer);
+  ds->impl = PerfettoDsImplCreate();
+  PerfettoDsSetOnStartCallback(ds->impl, on_start);
+  PerfettoDsSetCbUserArg(ds->impl, user_arg);
+  return PerfettoDsImplRegister(ds->impl, &ds->enabled, bytes.data(),
+                                bytes.size());
+}
+
+// Starts a packet like a client built with headers from before tracing v2.
+// It calls the old PerfettoDsTracerImplPacketBegin() and writes a
+// length-delimited root message.
+void LegacyClientPacketBegin(PerfettoDsTracerIterator* iterator,
+                             PerfettoDsRootTracePacket* root) {
+  root->writer.writer = PerfettoDsTracerImplPacketBegin(iterator->impl.tracer);
+  PerfettoPbMsgInit(&root->msg.msg, &root->writer);
+}
+
+// Runs each test on the two backends that can give tracing v2 writers.
+// The parameter is the backend.
+// For the system backend, the test starts a service in this process and
+// connects to it over IPC.
+class SharedLibTracingV2Test
+    : public SharedLibDataSourceTest,
+      public testing::WithParamInterface<PerfettoBackendTypes> {
+ protected:
+  uint32_t backend() const override { return GetParam(); }
+  // A ring buffer needs at least two chunks, so a 64 KiB hint cannot hold one
+  // with 64 KiB chunks.
+  // Tests ask for that chunk size to make ring buffer creation fail.
+  uint32_t shmem_size_hint_kb() const override { return 64; }
+
+  // Starts data_source_2 on this backend and waits for OnStart().
+  TracingSession StartDs2Session(TracingSession::Builder builder) {
+    WaitableEvent started;
+    EXPECT_CALL(ds2_callbacks_, OnStart(_, _, _, _, _)).WillOnce([&started] {
+      started.Notify();
+    });
+    TracingSession session = builder.set_data_source_name(kDataSourceName2)
+                                 .set_backend(backend())
+                                 .Build();
+    started.WaitForNotification();
+    return session;
+  }
+
+  // Writes a TestEvent with |str| to each instance of data_source_2.
+  // Returns the packet encoding of each instance.
+  static std::vector<uint32_t> WriteDs2(const std::string& str) {
+    std::vector<uint32_t> encodings;
+    PERFETTO_DS_TRACE(data_source_2, ctx) {
+      PerfettoDsRootTracePacket packet;
+      PerfettoDsTracerPacketBegin(&ctx, &packet);
+      encodings.push_back(packet.msg.msg.encoding);
+      perfetto_protos_TestEvent event;
+      perfetto_protos_TracePacket_begin_for_testing(&packet.msg, &event);
+      perfetto_protos_TestEvent_set_str(&event, str.data(), str.size());
+      perfetto_protos_TracePacket_end_for_testing(&packet.msg, &event);
+      PerfettoDsTracerPacketEnd(&ctx, &packet);
+    }
+    return encodings;
+  }
+
+  // Flushes and stops |session|, then returns the TestEvent strings in its
+  // trace.
+  static std::vector<std::string> StopAndReadStrings(TracingSession* session) {
+    EXPECT_TRUE(session->FlushBlocking(5000));
+    session->StopBlocking();
+    std::vector<std::string> strings;
+    std::vector<uint8_t> trace = session->ReadBlocking();
+    for (auto packet : FieldView(trace)) {
+      for (auto event : IdFieldView(
+               packet, perfetto_protos_TracePacket_for_testing_field_number)) {
+        for (auto str :
+             IdFieldView(event, perfetto_protos_TestEvent_str_field_number)) {
+          strings.emplace_back(
+              reinterpret_cast<const char*>(str.value.delimited.start),
+              str.value.delimited.len);
+        }
+      }
+    }
+    return strings;
+  }
+
+  void SetUp() override {
+    if (backend() == PERFETTO_BACKEND_SYSTEM) {
+      // Start() also points the producer and consumer socket environment
+      // variables at the service.
+      // TearDown() restores them through |env_cleaner_|.
+      service_ = std::make_unique<perfetto::ServiceThread>(
+          socket_dir_.path() + "/producer", socket_dir_.path() + "/consumer");
+      env_cleaner_ = service_->Start();
+    }
+    SharedLibDataSourceTest::SetUp();
+    ASSERT_TRUE(LegacyClientRegister(
+        &legacy_ds_, kLegacyDataSourceName,
+        [](PerfettoDsImpl*, PerfettoDsInstanceIndex, void* arg, void*,
+           PerfettoDsOnStartArgs*) {
+          static_cast<WaitableEvent*>(arg)->Notify();
+        },
+        &legacy_ds_started_));
+  }
+  void TearDown() override {
+    SharedLibDataSourceTest::TearDown();
+    perfetto::shlib::DsImplDestroy(legacy_ds_.impl);
+    if (service_) {
+      service_.reset();
+      perfetto::base::Unlink((socket_dir_.path() + "/producer").c_str());
+      perfetto::base::Unlink((socket_dir_.path() + "/consumer").c_str());
+      env_cleaner_.Clean();
+    }
+  }
+  WaitableEvent legacy_ds_started_;
+  PerfettoDs legacy_ds_ = PERFETTO_DS_INIT();
+  perfetto::base::TempDir socket_dir_ = perfetto::base::TempDir::Create();
+  std::unique_ptr<perfetto::ServiceThread> service_;
+  perfetto::TestEnvCleaner env_cleaner_;
+};
+
+// A data source that selects v2 writes a packet with a nested message.
+// The 2000-byte payload does not fit one 256-byte chunk.
+// The trace has the packet as standard protobuf.
+TEST_P(SharedLibTracingV2Test, NestedPacketRoundTrip) {
+  auto session =
+      StartDs2Session(TracingSession::Builder().set_v2_probability(100));
+  bool wrote = false;
+  WaitableEvent flushed;
+  std::string payload(2000, 'v');
+  PERFETTO_DS_TRACE(data_source_2, ctx) {
+    wrote = true;
+    PerfettoDsRootTracePacket packet;
+    PerfettoDsTracerPacketBegin(&ctx, &packet);
+    EXPECT_EQ(packet.msg.msg.encoding, kV2Encoding);
+    perfetto_protos_TestEvent event;
+    perfetto_protos_TracePacket_begin_for_testing(&packet.msg, &event);
+    perfetto_protos_TestEvent_TestPayload nested;
+    perfetto_protos_TestEvent_begin_payload(&event, &nested);
+    perfetto_protos_TestEvent_TestPayload_set_str(&nested, payload.data(),
+                                                  payload.size());
+    perfetto_protos_TestEvent_end_payload(&event, &nested);
+    perfetto_protos_TracePacket_end_for_testing(&packet.msg, &event);
+    PerfettoDsTracerPacketEnd(&ctx, &packet);
+    PerfettoDsTracerFlush(
+        &ctx, [](void* arg) { static_cast<WaitableEvent*>(arg)->Notify(); },
+        &flushed);
+  }
+  ASSERT_TRUE(wrote);
+  flushed.WaitForNotification();
+  ASSERT_TRUE(session.FlushBlocking(5000));
+  session.StopBlocking();
+  bool found = false;
+  auto trace = session.ReadBlocking();
+  for (auto trace_field : FieldView(trace)) {
+    IdFieldView events(trace_field,
+                       perfetto_protos_TracePacket_for_testing_field_number);
+    if (events.size() == 0)
+      continue;
+    found = true;
+    EXPECT_THAT(FieldView(events.front()),
+                ElementsAre(PbField(
+                    perfetto_protos_TestEvent_payload_field_number,
+                    MsgField(ElementsAre(PbField(
+                        perfetto_protos_TestEvent_TestPayload_str_field_number,
+                        StringField(payload)))))));
+  }
+  EXPECT_TRUE(found);
+}
+
+// A client built with headers from before tracing v2 keeps v1, also when the
+// config selects v2 for its data source.
+// Its packets reach the trace.
+TEST_P(SharedLibTracingV2Test, LegacyClientKeepsV1) {
+  auto session = TracingSession::Builder()
+                     .set_data_source_name(kLegacyDataSourceName)
+                     .set_backend(backend())
+                     .set_v2_probability(100)
+                     .Build();
+  legacy_ds_started_.WaitForNotification();
+  bool wrote = false;
+  PERFETTO_DS_TRACE(legacy_ds_, ctx) {
+    wrote = true;
+    PerfettoDsRootTracePacket packet;
+    LegacyClientPacketBegin(&ctx, &packet);
+    perfetto_protos_TestEvent event;
+    perfetto_protos_TracePacket_begin_for_testing(&packet.msg, &event);
+    perfetto_protos_TestEvent_set_cstr_str(&event, "legacy packet");
+    perfetto_protos_TracePacket_end_for_testing(&packet.msg, &event);
+    PerfettoDsTracerPacketEnd(&ctx, &packet);
+  }
+  ASSERT_TRUE(wrote);
+  EXPECT_THAT(StopAndReadStrings(&session), ElementsAre("legacy packet"));
+}
+
+// Only an instance that selects v2 initializes the ring buffer.
+// Each instance that does not select v2 asks for 64 KiB chunks, which cannot
+// fit.
+// If one of them initialized the ring buffer, the attempt would fail for good,
+// and the selected instance below would get no v2 writer.
+// The data_source_2 sessions reuse one instance slot.
+TEST_P(SharedLibTracingV2Test, OnlySelectedInstancesInitializeRingBuffer) {
+  constexpr uint32_t kTooLargeChunkSize = 64 * 1024;
+
+  // Probability 0 does not select v2.
+  {
+    TracingSession session = StartDs2Session(
+        TracingSession::Builder().set_v2_probability(0).add_v2_chunk_size(
+            kTooLargeChunkSize));
+    EXPECT_THAT(WriteDs2("zero probability"), ElementsAre(kV1Encoding));
+    EXPECT_THAT(StopAndReadStrings(&session), ElementsAre("zero probability"));
+  }
+  // A client that registered with the old C ABI does not select v2.
+  {
+    TracingSession session = TracingSession::Builder()
+                                 .set_data_source_name(kLegacyDataSourceName)
+                                 .set_backend(backend())
+                                 .set_v2_probability(100)
+                                 .add_v2_chunk_size(kTooLargeChunkSize)
+                                 .Build();
+    legacy_ds_started_.WaitForNotification();
+    PERFETTO_DS_TRACE(legacy_ds_, ctx) {
+      PerfettoDsRootTracePacket packet;
+      PerfettoDsTracerPacketBegin(&ctx, &packet);
+      EXPECT_EQ(packet.msg.msg.encoding, kV1Encoding);
+      PerfettoDsTracerPacketEnd(&ctx, &packet);
+    }
+    session.StopBlocking();
+  }
+  // The service does not permit v2 for a v1 target buffer.
+  {
+    TracingSession session =
+        StartDs2Session(TracingSession::Builder()
+                            .set_v2_probability(100)
+                            .add_v2_chunk_size(kTooLargeChunkSize)
+                            .set_trace_buffer_v2(false));
+    EXPECT_THAT(WriteDs2("v1 buffer"), ElementsAre(kV1Encoding));
+    EXPECT_THAT(StopAndReadStrings(&session), ElementsAre("v1 buffer"));
+  }
+  // The first instance that selects v2 creates the ring buffer, with its
+  // 256-byte chunks.
+  {
+    TracingSession session = StartDs2Session(
+        TracingSession::Builder().set_v2_probability(100).add_v2_chunk_size(
+            256));
+    EXPECT_THAT(WriteDs2("first v2"), ElementsAre(kV2Encoding));
+    EXPECT_THAT(StopAndReadStrings(&session), ElementsAre("first v2"));
+  }
+  // The slot's earlier choice does not carry over to a new instance.
+  {
+    TracingSession session =
+        StartDs2Session(TracingSession::Builder().set_v2_probability(0));
+    EXPECT_THAT(WriteDs2("v1 again"), ElementsAre(kV1Encoding));
+    EXPECT_THAT(StopAndReadStrings(&session), ElementsAre("v1 again"));
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Backend,
+    SharedLibTracingV2Test,
+    testing::Values(PERFETTO_BACKEND_IN_PROCESS, PERFETTO_BACKEND_SYSTEM),
+    [](const testing::TestParamInfo<PerfettoBackendTypes>& info) {
+      return info.param == PERFETTO_BACKEND_SYSTEM ? "System" : "InProcess";
+    });
+#endif  // PERFETTO_IPC && (LINUX_BUT_NOT_QNX || ANDROID)
 
 TEST_F(SharedLibDataSourceTest, DisabledNotExecuted) {
   bool executed = false;
@@ -2029,11 +2327,24 @@ TEST_F(SharedLibTrackEventTest, TrackEventHlDynamicCategoryMultipleSessions) {
                                   StringField("interned_string"))))))))))))));
 }
 
-TEST_F(SharedLibTrackEventTest, TrackEventHlInstant) {
-  TracingSession tracing_session = TracingSession::Builder()
-                                       .set_data_source_name("track_event")
-                                       .add_enabled_category("*")
-                                       .Build();
+// Runs each test on a v1 writer and on a tracing v2 writer.
+// The parameter is the packet encoding that the writer gives.
+class SharedLibTrackEventEncodingTest
+    : public SharedLibTrackEventTest,
+      public testing::WithParamInterface<uint32_t> {
+ protected:
+  TracingSession StartSession() {
+    auto builder = TracingSession::Builder()
+                       .set_data_source_name("track_event")
+                       .add_enabled_category("*");
+    if (GetParam() == kV2Encoding)
+      builder.set_v2_probability(100);
+    return builder.Build();
+  }
+};
+
+TEST_P(SharedLibTrackEventEncodingTest, TrackEventHlInstant) {
+  auto tracing_session = StartSession();
 
   PERFETTO_TE(cat1, PERFETTO_TE_INSTANT("event"));
 
@@ -2072,11 +2383,8 @@ TEST_F(SharedLibTrackEventTest, TrackEventHlInstant) {
   EXPECT_TRUE(found);
 }
 
-TEST_F(SharedLibTrackEventTest, TrackEventLlInstant) {
-  TracingSession tracing_session = TracingSession::Builder()
-                                       .set_data_source_name("track_event")
-                                       .add_enabled_category("*")
-                                       .Build();
+TEST_P(SharedLibTrackEventEncodingTest, TrackEventLlInstant) {
+  auto tracing_session = StartSession();
 
   if (PERFETTO_UNLIKELY(PERFETTO_ATOMIC_LOAD_EXPLICIT(
           cat1.enabled, PERFETTO_MEMORY_ORDER_RELAXED))) {
@@ -2091,6 +2399,7 @@ TEST_F(SharedLibTrackEventTest, TrackEventLlInstant) {
       {
         struct PerfettoDsRootTracePacket trace_packet;
         PerfettoTeLlPacketBegin(&ctx, &trace_packet);
+        EXPECT_EQ(trace_packet.msg.msg.encoding, GetParam());
         PerfettoTeLlWriteTimestamp(&trace_packet.msg, &timestamp);
         perfetto_protos_TracePacket_set_sequence_flags(
             &trace_packet.msg,
@@ -2153,6 +2462,13 @@ TEST_F(SharedLibTrackEventTest, TrackEventLlInstant) {
   }
   EXPECT_TRUE(found);
 }
+
+INSTANTIATE_TEST_SUITE_P(Encoding,
+                         SharedLibTrackEventEncodingTest,
+                         testing::Values(kV1Encoding, kV2Encoding),
+                         [](const testing::TestParamInfo<uint32_t>& info) {
+                           return info.param == kV2Encoding ? "V2" : "V1";
+                         });
 
 TEST_F(SharedLibTrackEventTest, TrackEventHlInstantNoIntern) {
   TracingSession tracing_session = TracingSession::Builder()
