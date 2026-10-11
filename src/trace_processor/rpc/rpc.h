@@ -212,6 +212,12 @@ class Rpc {
   static std::optional<TraceProcessor::ExportFormat> ParseExportFormat(int32_t);
   base::Status Export(TraceProcessor::ExportFormat, const ExportCallback&);
 
+  // Runs the query in the proto-encoded QueryArgs and streams its result as an
+  // Arrow IPC stream, using the same callback pattern as Export(). The query
+  // runs to completion before the first callback, so a query error is
+  // returned without any bytes having been emitted.
+  base::Status QueryArrow(const uint8_t*, size_t, const ExportCallback&);
+
   TraceProcessor* trace_processor() const { return trace_processor_.get(); }
 
  private:

@@ -46,6 +46,7 @@
 #include "perfetto/trace_processor/trace_blob.h"
 #include "perfetto/trace_processor/trace_blob_view.h"
 #include "perfetto/trace_processor/trace_processor.h"
+#include "src/trace_processor/rpc/arrow_query_result_serializer.h"
 #include "src/trace_processor/tp_metatrace.h"
 
 #include "protos/perfetto/trace_processor/metatrace_categories.pbzero.h"
@@ -868,6 +869,47 @@ void Rpc::Query(const uint8_t* args,
     }
     buffered.Reset();
   }
+}
+
+base::Status Rpc::QueryArrow(const uint8_t* args,
+                             size_t len,
+                             const ExportCallback& callback) {
+  protos::pbzero::QueryArgs::Decoder query(args, len);
+  std::string sql = query.sql_query().ToStdString();
+  PERFETTO_TP_TRACE(metatrace::Category::API_TIMELINE, "RPC_QUERY_ARROW",
+                    [&](metatrace::Record* r) {
+                      r->AddArg("SQL", sql);
+                      if (query.has_tag()) {
+                        r->AddArg("tag", query.tag());
+                      }
+                    });
+  ArrowQueryResultSerializer serializer(trace_processor_->ExecuteQuery(sql));
+  RETURN_IF_ERROR(serializer.Run());
+
+  // Coalesce the many small Arrow buffers into chunks; large column buffers
+  // are passed through without a copy.
+  constexpr size_t kChunkSize = 1024 * 1024;
+  std::vector<uint8_t> chunk;
+  chunk.reserve(kChunkSize);
+  auto flush = [&]() -> base::Status {
+    if (chunk.empty()) {
+      return base::OkStatus();
+    }
+    base::Status status = callback(chunk.data(), chunk.size(), true);
+    chunk.clear();
+    return status;
+  };
+  RETURN_IF_ERROR(
+      serializer.Write([&](const uint8_t* data, size_t size) -> base::Status {
+        if (size >= kChunkSize) {
+          RETURN_IF_ERROR(flush());
+          return callback(data, size, true);
+        }
+        chunk.insert(chunk.end(), data, data + size);
+        return chunk.size() >= kChunkSize ? flush() : base::OkStatus();
+      }));
+  RETURN_IF_ERROR(flush());
+  return callback(nullptr, 0, false);
 }
 
 std::optional<TraceProcessor::ExportFormat> Rpc::ParseExportFormat(

@@ -308,6 +308,46 @@ void Httpd::OnHttpRequest(const base::HttpRequest& req) {
     return;
   }
 
+  // Runs a query and streams its result as an Arrow IPC stream. Errors are
+  // known before any data is sent, so they get a proper 400 response.
+  if (req.uri == "/query_arrow") {
+    bool started = false;
+    auto on_chunk = [&](const uint8_t* buf, size_t len,
+                        bool has_more) -> base::Status {
+      if (!started) {
+        started = true;
+        conn.SendResponseHeaders(
+            "200 OK", chunked_headers,
+            base::HttpServerConnection::kOmitContentLength);
+      }
+      if (buf && len > 0) {
+        base::StackString<32> chunk_hdr("%zx\r\n", len);
+        if (!conn.SendResponseBody(chunk_hdr.c_str(), chunk_hdr.len()) ||
+            !conn.SendResponseBody(buf, len) ||
+            !conn.SendResponseBody("\r\n", 2)) {
+          return base::ErrStatus("HTTP client disconnected during query");
+        }
+      }
+      if (!has_more && !conn.SendResponseBody("0\r\n\r\n", 5)) {
+        return base::ErrStatus("HTTP client disconnected during query");
+      }
+      return base::OkStatus();
+    };
+    base::Status status = global_trace_processor_rpc_.QueryArrow(
+        reinterpret_cast<const uint8_t*>(req.body.data()), req.body.size(),
+        on_chunk);
+    if (status.ok()) {
+      return;
+    }
+    if (!started) {
+      return conn.SendResponseAndClose("400 Bad Request", default_headers,
+                                       status.c_message());
+    }
+    // The 200 response has already started; leave the chunked body
+    // incomplete to signal the failure.
+    return conn.Close();
+  }
+
   if (req.uri == "/compute_metric") {
     std::vector<uint8_t> res = global_trace_processor_rpc_.ComputeMetric(
         reinterpret_cast<const uint8_t*>(req.body.data()), req.body.size());

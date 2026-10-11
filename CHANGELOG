@@ -3,6 +3,10 @@ Unreleased:
    * Changed compression logic to always emit clock snapshot, trace config and
    trace UUID uncompressed for metadata inspection by on-device tools.
   Trace Processor:
+   * Added a `/query_arrow` HTTP endpoint which returns a query result as an
+     Arrow IPC stream, and `TraceProcessor.query_arrow()` /
+     `query_arrow_bytes()` in the Python API. This avoids creating a Python
+     object per cell and is ~10x faster than `query()` for large results.
    * Fixed conversion of TracingServiceEvent timestamps (tracing_started_ns,
      all_data_source_started_ns, ...) to trace time when primary_trace_clock
      is not BOOTTIME. They were previously stored unconverted, which could

@@ -224,6 +224,36 @@ class TraceProcessor:
     return TraceProcessor.QueryResultIterator(response.column_names,
                                               response.batch)
 
+  def query_arrow_bytes(self, sql: str) -> bytes:
+    """Executes a query and returns its result as an Arrow IPC stream.
+
+    Unlike query(), no Python object is created per row or cell: the bytes can
+    be handed straight to pyarrow (`pa.ipc.open_stream`), DuckDB, polars or
+    written to a file. Each column has a single Arrow type: null, int64,
+    float64, utf8 or binary (mixed SQLite types are widened).
+
+    Raises TraceProcessorException if the query fails.
+    """
+    error, data = self.http.query_arrow(sql)
+    if error is not None:
+      raise TraceProcessorException(error)
+    return data
+
+  def query_arrow(self, sql: str):
+    """Executes a query and returns its result as a pyarrow.Table.
+
+    This is the fast path for large results: it avoids the per-cell Python
+    work of query() and is typically 10x+ faster for big tables. Requires the
+    pyarrow package. Raises TraceProcessorException if the query fails.
+    """
+    try:
+      import pyarrow.ipc  # pylint: disable=import-outside-toplevel
+    except ImportError as e:
+      raise TraceProcessorException(
+          'query_arrow() requires pyarrow; use query_arrow_bytes() to get the '
+          'raw Arrow IPC stream instead') from e
+    return pyarrow.ipc.open_stream(self.query_arrow_bytes(sql)).read_all()
+
   def trace_summary(self,
                     specs: List[Union[str, bytes]],
                     metric_ids: Optional[List[str]] = None,

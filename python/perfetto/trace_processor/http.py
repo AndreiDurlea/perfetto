@@ -15,7 +15,7 @@
 
 import http.client
 import shutil
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 from perfetto.trace_processor.protos import ProtoFactory
 
@@ -35,6 +35,20 @@ class TraceProcessorHttp:
       result = self.protos.QueryResult()
       result.ParseFromString(f.read())
       return result
+
+  def query_arrow(self, query: str) -> Tuple[Optional[str], bytes]:
+    """Runs a query and returns (error, Arrow IPC stream bytes)."""
+    args = self.protos.QueryArgs()
+    args.sql_query = query
+    self.conn.request('POST', '/query_arrow', body=args.SerializeToString())
+    with self.conn.getresponse() as f:
+      data = f.read()
+      if f.status == 404:
+        return ('This trace_processor does not support Arrow query results; '
+                'update it to a newer version', b'')
+      if f.status != 200:
+        return (data.decode('utf-8', 'replace') or f.reason, b'')
+      return (None, data)
 
   def compute_metric(self, metrics: List[str]):
     args = self.protos.ComputeMetricArgs()

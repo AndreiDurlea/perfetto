@@ -25,6 +25,8 @@ assert(enable_perfetto_trace_processor_sqlite)
 # interface) and by the :httpd module for the HTTP interface.
 source_set("rpc") {
   sources = [
+    "arrow_query_result_serializer.cc",
+    "arrow_query_result_serializer.h",
     "query_result_serializer.cc",
     "rpc.cc",
     "rpc.h",
@@ -40,6 +42,8 @@ source_set("rpc") {
     "../../base:version",
     "../../protozero",
     "../../protozero:proto_ring_buffer",
+    "../core/dataframe",
+    "../util:flatbuffer_writer",
   ]
   public_deps = [
     "../../../include/perfetto/ext/trace_processor/rpc:query_result_serializer",
@@ -166,6 +170,7 @@ if (enable_perfetto_ipc) {
 perfetto_unittest_source_set("unittests") {
   testonly = true
   sources = [
+    "arrow_query_result_serializer_unittest.cc",
     "query_result_serializer_unittest.cc",
     "rpc_unittest.cc",
     "session_paths_unittest.cc",
@@ -180,6 +185,8 @@ perfetto_unittest_source_set("unittests") {
     "../../../protos/perfetto/trace_processor:zero",
     "../../base",
     "../../protozero",
+    "../core/dataframe",
+    "../util:flatbuffer_reader",
   ]
 }
 
