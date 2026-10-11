@@ -253,8 +253,10 @@ SELECT
   extract_arg(s.arg_set_id, 'Surface frame token') AS surface_frame_token,
   t.upid,
   extract_arg(s.arg_set_id, 'Layer name') AS layer_name
-FROM slice AS s
-JOIN process_track AS t
+-- Drive the join from the few matching tracks: otherwise SQLite scans every
+-- slice in the trace and this runs on every trace load.
+FROM process_track AS t
+CROSS JOIN slice AS s
   ON s.track_id = t.id
 WHERE
   t.type = 'android_expected_frame_timeline'
@@ -347,8 +349,10 @@ SELECT
   extract_arg(s.arg_set_id, 'Latched unsignaled count') AS latched_unsignaled_count,
   extract_arg(s.arg_set_id, 'Addressable unsignaled latch count') AS addressable_unsignaled_latch_count,
   extract_arg(s.arg_set_id, 'Latched fence state') AS latched_fence_state
-FROM slice AS s
-JOIN process_track AS t
+-- Drive the join from the few matching tracks: otherwise SQLite scans every
+-- slice in the trace and this runs on every trace load.
+FROM process_track AS t
+CROSS JOIN slice AS s
   ON s.track_id = t.id
 WHERE
   t.type = 'android_actual_frame_timeline'
