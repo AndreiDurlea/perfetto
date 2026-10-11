@@ -67,8 +67,15 @@ void RegisterAdditionalModules(ProtoImporterModuleContext* module_context,
       new NetworkTraceModule(module_context, context));
   module_context->modules.emplace_back(
       new GraphicsEventModule(module_context, context));
-  module_context->modules.emplace_back(
-      new HeapGraphModule(module_context, context));
+  // Java heap graphs often dominate import time (60-75% on traces with a heap
+  // dump). Bulk extraction which does not need them can skip them with
+  // `--dev --dev-flag skip-heap-graph=true`.
+  auto skip_heap_graph = context->config.dev_flags.find("skip-heap-graph");
+  if (skip_heap_graph == context->config.dev_flags.end() ||
+      skip_heap_graph->second != "true") {
+    module_context->modules.emplace_back(
+        new HeapGraphModule(module_context, context));
+  }
   module_context->modules.emplace_back(
       new DeobfuscationModule(module_context, context));
   module_context->modules.emplace_back(
