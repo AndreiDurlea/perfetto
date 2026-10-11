@@ -111,6 +111,7 @@
 #include "src/tracing/service/packet_stream_validator.h"
 #include "src/tracing/service/random.h"
 #include "src/tracing/service/trace_buffer.h"
+#include "src/tracing/service/trace_buffer_protovms.h"
 #include "src/tracing/service/trace_buffer_v1.h"
 #include "src/tracing/service/trace_buffer_v2.h"
 #include "src/tracing/service/tracing_service_endpoints_impl.h"
@@ -3217,7 +3218,7 @@ void TracingServiceImpl::MaybeSetUpProtoVm(
     return;
   }
   auto* buffer = static_cast<TraceBufferV2*>(it->second.get());
-  buffer->MaybeSetUpProtoVm(
+  buffer->protovms()->MaybeSetUp(
       ds_config.name(), ds_instance.descriptor.protovm_program_raw(),
       ds_config.protovm_config().memory_limit_kb(), ds_instance.producer_id);
 }
@@ -4565,7 +4566,7 @@ void TracingServiceImpl::MaybeEmitProtoVmInstances(
       continue;
     }
     auto* buffer = static_cast<TraceBufferV2*>(it->second.get());
-    for (const TraceBufferV2::Vm& vm : buffer->GetProtoVmInstances()) {
+    for (const TraceBufferProtoVms::Vm& vm : buffer->protovms()->instances()) {
       auto* vm_instance = get_packet_protovms()->add_instance();
       vm_instance->AppendString(
           protos::pbzero::TracePacket::ProtoVms::Instance::kProgramFieldNumber,
