@@ -5,6 +5,9 @@ Unreleased:
    * Added optional compaction to TraceBufferV2 to release unused buffer pages
      after periodic reads. Enable `experimental_trace_buffer_v2_compaction`
      in TraceConfig to use it.
+   * Added the experimental TraceBufferV3, which keeps the packets of a buffer
+     compressed with zstd. Set `experimental_mode: TRACE_BUFFER_V3` in a
+     BufferConfig to use it. Requires a tracing service built with zstd.
   Trace Processor:
    * Fixed conversion of TracingServiceEvent timestamps (tracing_started_ns,
      all_data_source_started_ns, ...) to trace time when primary_trace_clock
