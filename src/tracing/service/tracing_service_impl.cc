@@ -121,6 +121,7 @@
 #include "src/tracing/service/zlib_compressor.h"
 #endif
 #if PERFETTO_BUILDFLAG(PERFETTO_ZSTD)
+#include "src/tracing/service/trace_buffer_v3.h"
 #include "src/tracing/service/zstd_compressor.h"
 #endif
 
@@ -350,7 +351,8 @@ void AppendOwnedSlicesToPacket(std::unique_ptr<uint8_t[]> data,
 }
 
 // Creates an empty trace buffer of the given implementation.
-// Returns nullptr if the memory allocation fails.
+// Returns nullptr if the memory allocation fails, or if this build does not
+// have the implementation.
 std::unique_ptr<TraceBuffer> CreateTraceBuffer(
     TraceBuffer::BufType type,
     size_t size_in_bytes,
@@ -360,6 +362,12 @@ std::unique_ptr<TraceBuffer> CreateTraceBuffer(
       return TraceBufferV1::Create(size_in_bytes, policy);
     case TraceBuffer::kV2:
       return TraceBufferV2::Create(size_in_bytes, policy);
+    case TraceBuffer::kV3:
+#if PERFETTO_BUILDFLAG(PERFETTO_ZSTD)
+      return TraceBufferV3::Create(size_in_bytes, policy);
+#else
+      return nullptr;
+#endif
   }
   return nullptr;
 }
@@ -2983,8 +2991,8 @@ void TracingServiceImpl::MaybeFilterPackets(TracingSession* tracing_session,
       vec[buffer_idx] += bytes_filtered_out;
     }
     AppendOwnedSlicesToPacket(std::move(filtered_packet.data),
-                              filtered_packet.size, kMaxTracePacketSliceSize,
-                              &packet);
+                              filtered_packet.size,
+                              TraceBuffer::kMaxTracePacketSliceSize, &packet);
   }
   auto end = clock_->GetWallTimeNs();
   tracing_session->filter_time_taken_ns +=
