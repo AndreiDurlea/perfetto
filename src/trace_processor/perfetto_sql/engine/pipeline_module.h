@@ -134,6 +134,16 @@ struct PipelineModule : sqlite::Module<PipelineModule> {
   static constexpr sqlite3_module kModule = CreateModule();
 };
 
+// Executes `plan` directly and collects its output batches into a `Dataframe`
+// without stepping row-by-row through SQLite VDBE.
+base::StatusOr<dataframe::Dataframe> ExecutePipelineToDataframe(
+    const pipeline::LogicalPlan& plan,
+    PerfettoSqlConnection& connection,
+    StringPool* pool,
+    std::vector<std::string> column_names,
+    std::vector<dataframe::AdhocDataframeBuilder::ColumnType> column_types,
+    std::string_view error_context);
+
 }  // namespace perfetto::trace_processor
 
 #endif  // SRC_TRACE_PROCESSOR_PERFETTO_SQL_ENGINE_PIPELINE_MODULE_H_

@@ -87,7 +87,48 @@ struct Group {
   std::string key;
   std::vector<Interval> intervals;
   bool nonoverlapping = true;
+  bool sorted = true;
+
+  void PushInterval(Ts start, Ts end, uint32_t id) {
+    if (!intervals.empty()) {
+      const Interval& prev = intervals.back();
+      if (sorted) {
+        bool after =
+            prev.start < start ||
+            (prev.start == start &&
+             (prev.end < end || (prev.end == end && prev.id <= id)));
+        if (!after) {
+          sorted = false;
+        } else if (nonoverlapping) {
+          nonoverlapping = !IsOverlapping(prev, Interval{start, end, id});
+        }
+      }
+    }
+    intervals.push_back({start, end, id});
+  }
 };
+
+void EncodeInt64Key(int64_t val, bool is_null, char out[9]) {
+  if (is_null) {
+    memset(out, 0, 9);
+    return;
+  }
+  out[0] = static_cast<char>(0xFF);
+  uint64_t bits = base::HostToBE64(
+      static_cast<uint64_t>(val ^ static_cast<int64_t>(0x8000000000000000)));
+  memcpy(out + 1, &bits, 8);
+}
+
+bool IsIntKeyColumn(const ColumnView& column) {
+  if (column.kind() == ColumnView::Kind::kSequence) {
+    return true;
+  }
+  if (column.kind() != ColumnView::Kind::kFlat) {
+    return false;
+  }
+  StorageType t = column.type();
+  return t.Is<Uint32>() || t.Is<Int32>() || t.Is<Int64>();
+}
 
 // One operand's groups, kept across runs to reuse their memory: the first
 // `used` are this run's. Held by pointer, so the keys the map views never
@@ -96,11 +137,10 @@ struct Groups {
   std::vector<std::unique_ptr<Group>> all;
   size_t used = 0;
   base::FlatHashMapV2<std::string_view, Group*> by_key;
+  std::vector<Group*> by_small_int;
+  Group* null_group = nullptr;
 
-  Group& Get(std::string_view key) {
-    if (Group** found = by_key.Find(key)) {
-      return **found;
-    }
+  Group& AllocGroup(std::string_view key) {
     if (used == all.size()) {
       all.emplace_back(std::make_unique<Group>());
     }
@@ -108,8 +148,36 @@ struct Groups {
     group.key.assign(key);
     group.intervals.clear();
     group.nonoverlapping = true;
+    group.sorted = true;
     by_key.Insert(group.key, &group);
     return group;
+  }
+  Group& Get(std::string_view key) {
+    if (Group** found = by_key.Find(key)) {
+      return **found;
+    }
+    return AllocGroup(key);
+  }
+  Group& GetSmallInt(uint32_t v) {
+    if (PERFETTO_UNLIKELY(v >= by_small_int.size())) {
+      by_small_int.resize(v + 1, nullptr);
+    }
+    Group* g = by_small_int[v];
+    if (PERFETTO_UNLIKELY(!g)) {
+      char buf[9];
+      EncodeInt64Key(static_cast<int64_t>(v), false, buf);
+      g = &AllocGroup(std::string_view(buf, 9));
+      by_small_int[v] = g;
+    }
+    return *g;
+  }
+  Group& GetNullInt() {
+    if (PERFETTO_UNLIKELY(!null_group)) {
+      char buf[9];
+      EncodeInt64Key(0, true, buf);
+      null_group = &AllocGroup(std::string_view(buf, 9));
+    }
+    return *null_group;
   }
   const Group* Find(std::string_view key) const {
     Group* const* found = by_key.Find(key);
@@ -118,6 +186,8 @@ struct Groups {
   void Clear() {
     used = 0;
     by_key.Clear();
+    std::fill(by_small_int.begin(), by_small_int.end(), nullptr);
+    null_group = nullptr;
   }
 };
 
@@ -192,40 +262,127 @@ base::Status Collect(const IntervalIntersectOperand& operand,
                      IntersectState::Scratch& scratch) {
   RowBatch& batch = scratch.batch;
   RowBatch& retained = scratch.retained;
+  uint32_t base_row = 0;
+  const bool has_retained = !operand.retained_columns.empty();
   while (operand.source->GetData(batch, state)) {
     RETURN_IF_ERROR(ValidateOperand(batch, operand, which));
+    uint32_t count = batch.size();
     FlatColumnReader<int64_t> ts(batch.column(operand.ts_column));
     FlatColumnReader<int64_t> dur(batch.column(operand.dur_column));
-    if (std::optional<uint32_t> bad = keys.Encode(batch, operand.key_columns)) {
-      return base::ErrStatus(
-          "INTERVAL INTERSECTION: operand %u's PER column %u must hold one "
-          "type, the same in every operand",
-          which + 1, *bad + 1);
-    }
-    for (uint32_t row = 0; row < batch.size(); ++row) {
-      int64_t start;
-      int64_t length;
-      if (!ts.Read(row, &start) || !dur.Read(row, &length)) {
-        continue;
+
+    if (operand.key_columns.empty()) {
+      Group& group = groups.used ? *groups.all[0] : groups.Get("");
+      for (uint32_t row = 0; row < count; ++row) {
+        int64_t start;
+        int64_t length;
+        if (!ts.Read(row, &start) || !dur.Read(row, &length)) {
+          continue;
+        }
+        if (PERFETTO_UNLIKELY(start < 0 || length < 0)) {
+          return base::ErrStatus(
+              "INTERVAL INTERSECTION: operand %u has a row whose ts or dur is "
+              "below zero",
+              which + 1);
+        }
+        group.PushInterval(static_cast<Ts>(start),
+                           static_cast<Ts>(start + length), base_row + row);
       }
-      if (start < 0 || length < 0) {
+    } else if (operand.key_columns.size() == 1 &&
+               IsIntKeyColumn(batch.column(operand.key_columns[0]))) {
+      // Validate key kind consistency across batches/operands using a 0-row
+      // slice so KeyEncoder::Classify runs without per-row key encoding.
+      retained.CopyFrom(batch);
+      retained.SetCardinality(0);
+      if (std::optional<uint32_t> bad =
+              keys.Encode(retained, operand.key_columns)) {
         return base::ErrStatus(
-            "INTERVAL INTERSECTION: operand %u has a row whose ts or dur is "
-            "below zero",
-            which + 1);
+            "INTERVAL INTERSECTION: operand %u's PER column %u must hold one "
+            "type, the same in every operand",
+            which + 1, *bad + 1);
       }
-      std::string_view key = keys.Key(row);
-      Group& group = groups.Get(key);
-      group.intervals.push_back({static_cast<Ts>(start),
-                                 static_cast<Ts>(start + length),
-                                 store.size() + row});
+      const ColumnView& kcol = batch.column(operand.key_columns[0]);
+      const auto* kvalid = kcol.validity();
+      const auto& ksel = kcol.selection();
+      auto get_int_group = [&](int64_t val) -> Group& {
+        if (val >= 0 && val < 65536) {
+          return groups.GetSmallInt(static_cast<uint32_t>(val));
+        }
+        char buf[9];
+        EncodeInt64Key(val, false, buf);
+        return groups.Get(std::string_view(buf, 9));
+      };
+      auto process_typed = [&](auto getter) -> base::Status {
+        for (uint32_t row = 0; row < count; ++row) {
+          int64_t start;
+          int64_t length;
+          if (!ts.Read(row, &start) || !dur.Read(row, &length)) {
+            continue;
+          }
+          if (PERFETTO_UNLIKELY(start < 0 || length < 0)) {
+            return base::ErrStatus(
+                "INTERVAL INTERSECTION: operand %u has a row whose ts or dur "
+                "is below zero",
+                which + 1);
+          }
+          uint32_t kidx = ksel.GetIndex(row);
+          Group& group = (kvalid && !kvalid->is_set(kidx))
+                             ? groups.GetNullInt()
+                             : get_int_group(getter(kidx));
+          group.PushInterval(static_cast<Ts>(start),
+                             static_cast<Ts>(start + length), base_row + row);
+        }
+        return base::OkStatus();
+      };
+      if (kcol.kind() == ColumnView::Kind::kSequence) {
+        RETURN_IF_ERROR(process_typed(
+            [](uint32_t idx) { return static_cast<int64_t>(idx); }));
+      } else if (kcol.type().Is<Uint32>()) {
+        const auto* d = static_cast<const uint32_t*>(kcol.data());
+        RETURN_IF_ERROR(process_typed(
+            [d](uint32_t idx) { return static_cast<int64_t>(d[idx]); }));
+      } else if (kcol.type().Is<Int32>()) {
+        const auto* d = static_cast<const int32_t*>(kcol.data());
+        RETURN_IF_ERROR(process_typed(
+            [d](uint32_t idx) { return static_cast<int64_t>(d[idx]); }));
+      } else {
+        const auto* d = static_cast<const int64_t*>(kcol.data());
+        RETURN_IF_ERROR(process_typed([d](uint32_t idx) { return d[idx]; }));
+      }
+    } else {
+      if (std::optional<uint32_t> bad =
+              keys.Encode(batch, operand.key_columns)) {
+        return base::ErrStatus(
+            "INTERVAL INTERSECTION: operand %u's PER column %u must hold one "
+            "type, the same in every operand",
+            which + 1, *bad + 1);
+      }
+      for (uint32_t row = 0; row < count; ++row) {
+        int64_t start;
+        int64_t length;
+        if (!ts.Read(row, &start) || !dur.Read(row, &length)) {
+          continue;
+        }
+        if (PERFETTO_UNLIKELY(start < 0 || length < 0)) {
+          return base::ErrStatus(
+              "INTERVAL INTERSECTION: operand %u has a row whose ts or dur is "
+              "below zero",
+              which + 1);
+        }
+        std::string_view key = keys.Key(row);
+        Group& group = groups.Get(key);
+        group.PushInterval(static_cast<Ts>(start),
+                           static_cast<Ts>(start + length), base_row + row);
+      }
     }
-    retained.Reset();
-    for (uint32_t column : operand.retained_columns) {
-      retained.AddColumn(batch.column(column), batch.owner(column));
+    base_row += count;
+    if (has_retained) {
+      retained.Reset();
+      for (uint32_t column : operand.retained_columns) {
+        retained.AddColumn(batch.column(column), batch.owner(column));
+      }
+      retained.SetCardinality(count);
+      RETURN_IF_ERROR(store.Append(retained));
     }
-    retained.SetCardinality(batch.size());
-    RETURN_IF_ERROR(store.Append(retained));
   }
   RETURN_IF_ERROR(operand.source->status(state));
 
@@ -233,17 +390,20 @@ base::Status Collect(const IntervalIntersectOperand& operand,
   // which never overlaps itself down a cheaper path.
   for (size_t g = 0; g < groups.used; ++g) {
     Group& group = *groups.all[g];
-    std::sort(group.intervals.begin(), group.intervals.end(),
-              [](const Interval& a, const Interval& b) {
-                if (a.start != b.start) {
-                  return a.start < b.start;
-                }
-                return a.end != b.end ? a.end < b.end : a.id < b.id;
-              });
-    for (size_t i = 1; i < group.intervals.size() && group.nonoverlapping;
-         ++i) {
-      group.nonoverlapping =
-          !IsOverlapping(group.intervals[i - 1], group.intervals[i]);
+    if (!group.sorted) {
+      std::sort(group.intervals.begin(), group.intervals.end(),
+                [](const Interval& a, const Interval& b) {
+                  if (a.start != b.start) {
+                    return a.start < b.start;
+                  }
+                  return a.end != b.end ? a.end < b.end : a.id < b.id;
+                });
+      group.nonoverlapping = true;
+      for (size_t i = 1; i < group.intervals.size() && group.nonoverlapping;
+           ++i) {
+        group.nonoverlapping =
+            !IsOverlapping(group.intervals[i - 1], group.intervals[i]);
+      }
     }
   }
   return base::OkStatus();
@@ -399,7 +559,9 @@ bool IntervalIntersect::GetData(RowBatch& out, OperatorState& state) const {
   int64_t* ts = s.ts.Values<int64_t>().data();
   int64_t* dur = s.dur.Values<int64_t>().data();
   for (uint32_t i = 0; i < count; ++i) {
-    s.scratch.gather_rows[i].resize(serving);
+    if (!operands_[i].retained_columns.empty()) {
+      s.scratch.gather_rows[i].resize(serving);
+    }
   }
   for (uint32_t row = 0; row < serving; ++row) {
     uint32_t at = s.served + row;
@@ -407,7 +569,9 @@ bool IntervalIntersect::GetData(RowBatch& out, OperatorState& state) const {
     dur[row] = static_cast<int64_t>(s.regions.ends[at] - s.regions.starts[at]);
     const uint32_t* from = s.regions.RowsOf(at);
     for (uint32_t i = 0; i < count; ++i) {
-      s.scratch.gather_rows[i][row] = from[i];
+      if (!operands_[i].retained_columns.empty()) {
+        s.scratch.gather_rows[i][row] = from[i];
+      }
     }
   }
   s.served += serving;
@@ -416,6 +580,9 @@ bool IntervalIntersect::GetData(RowBatch& out, OperatorState& state) const {
   out.AddColumn(ColumnView::Reference(StorageType{Int64{}}, ts));
   out.AddColumn(ColumnView::Reference(StorageType{Int64{}}, dur));
   for (uint32_t i = 0; i < count; ++i) {
+    if (operands_[i].retained_columns.empty()) {
+      continue;
+    }
     const uint32_t* rows = s.scratch.gather_rows[i].data();
     s.stores[i]->View(&s.gathered[i], {rows, rows + serving});
     for (uint32_t c = 0; c < s.gathered[i].column_count(); ++c) {

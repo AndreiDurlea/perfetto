@@ -63,6 +63,7 @@ base::Status IntervalFlatten::BuildPlan(Compiler* c, uint32_t stage) {
       RETURN_IF_ERROR(c->CheckListedOnce(seen, name, col_id));
       ASSIGN_OR_RETURN(ColumnId key, c->Resolve(name, col_id));
       flatten.keys_.push_back(key);
+      flatten.carried_keys_.push_back(key);
       keys.push_back({NamedColumn{std::move(name), key}, col_id});
     }
   }
@@ -106,6 +107,10 @@ base::Status IntervalFlatten::BuildPlan(Compiler* c, uint32_t stage) {
 
 std::optional<uint32_t> IntervalFlatten::Prune(std::vector<bool>* needed) {
   auto& flatten = *this;
+  carried_keys_.erase(
+      std::remove_if(carried_keys_.begin(), carried_keys_.end(),
+                     [&](ColumnId key) { return !(*needed)[key]; }),
+      carried_keys_.end());
   aggregates_.erase(std::remove_if(aggregates_.begin(), aggregates_.end(),
                                    [&](const IntervalFlatten::Aggregate& agg) {
                                      return !(*needed)[agg.output];
@@ -135,10 +140,12 @@ void IntervalFlatten::Lower(Lowering* c, const PlanNode& node) const {
   ex::IntervalFlattenSpec spec;
   spec.ts_column = c->Position(flatten.ts_);
   spec.dur_column = c->Position(flatten.dur_);
-  for (ColumnId key : flatten.keys_) {
+  for (ColumnId key : flatten.carried_keys_) {
     spec.key_columns.push_back(c->Position(key));
   }
-  spec.group_column = c->order().group_column;
+  if (!flatten.keys_.empty()) {
+    spec.group_column = c->order().group_column;
+  }
   for (const IntervalFlatten::Aggregate& agg : flatten.aggregates_) {
     ex::IntervalFlattenSpec::Aggregate lowered;
     switch (agg.function) {
@@ -159,13 +166,14 @@ void IntervalFlatten::Lower(Lowering* c, const PlanNode& node) const {
   c->ResetLayout();
   c->Define(flatten.out_ts_);
   c->Define(flatten.out_dur_);
-  for (ColumnId key : flatten.keys_) {
+  for (ColumnId key : flatten.carried_keys_) {
     c->Define(key);
   }
   for (const IntervalFlatten::Aggregate& agg : flatten.aggregates_) {
     c->Define(agg.output);
   }
-  c->SetOrder({flatten.keys_, c->AllocateTemporaryColumn(), {flatten.out_ts_}});
+  c->SetOrder(
+      {flatten.carried_keys_, c->AllocateTemporaryColumn(), {flatten.out_ts_}});
 }
 
 const OperationRegistration& IntervalFlatten::registration() const {
@@ -214,6 +222,7 @@ void IntervalFlatten::DecodePlan(PlanReader* c, Available* available_columns) {
   for (ColumnId& key : flatten.keys_) {
     key = c->reader().Position(available);
   }
+  flatten.carried_keys_ = flatten.keys_;
   flatten.aggregates_.resize(c->reader().Count());
   for (IntervalFlatten::Aggregate& agg : flatten.aggregates_) {
     switch (c->reader().U8()) {

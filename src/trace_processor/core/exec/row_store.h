@@ -37,6 +37,7 @@ class RowStore {
   base::Status Append(const RowBatch&);
   uint32_t size() const { return size_; }
   uint32_t View(RowBatch* out, uint32_t offset, uint32_t count) const;
+  uint32_t ViewReverse(RowBatch* out, uint32_t end_offset, uint32_t count);
   // Gathers up to kMaxBatchRows in the requested order, including duplicates.
   // Output owns its buffers and survives later calls and store destruction.
   uint32_t View(RowBatch* out, Span<const uint32_t> rows);

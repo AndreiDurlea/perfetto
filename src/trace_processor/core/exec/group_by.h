@@ -51,6 +51,15 @@ class GroupBy : public Breaker {
     // The keys `group_of` views.
     BumpAllocator group_keys;
     base::FlatHashMapV2<std::string_view, uint32_t> group_of;
+
+    // Fast path for a single integer key column.
+    static constexpr uint32_t kNoGroup = ~uint32_t{0};
+    std::optional<int> int_key_mode;  // 1 if single integer key, -1 otherwise
+    uint32_t num_groups = 0;
+    uint32_t null_group = kNoGroup;
+    std::vector<uint32_t> small_int_groups;
+    base::FlatHashMapV2<int64_t, uint32_t> int_group_of;
+
     FlexVector<uint32_t> groups;
     RowStore rows;
     FlexVector<uint32_t> next;

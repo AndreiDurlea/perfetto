@@ -128,6 +128,52 @@ base::Status ReadKeys(const ColumnView& column,
   return base::OkStatus();
 }
 
+template <typename T>
+bool CheckSequentialIds(const ColumnView& ids, uint32_t count, uint32_t start) {
+  const auto* data = static_cast<const T*>(ids.data());
+  const BitVector* validity = ids.validity();
+  RowSelection selection = ids.selection();
+  if (!validity && selection.is_range()) {
+    const T* from = data + selection.offset();
+    for (uint32_t i = 0; i < count; ++i) {
+      if (from[i] != static_cast<T>(start + i)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t index = selection.GetIndex(i);
+    if ((validity && !validity->is_set(index)) ||
+        data[index] != static_cast<T>(start + i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename T>
+bool ExtractParentsInOrder(const ColumnView& parents,
+                           uint32_t count,
+                           uint32_t start,
+                           uint32_t* out) {
+  const auto* data = static_cast<const T*>(parents.data());
+  const BitVector* validity = parents.validity();
+  RowSelection selection = parents.selection();
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t index = selection.GetIndex(i);
+    if (validity && !validity->is_set(index)) {
+      out[i] = kNoNode;
+    } else if (data[index] >= 0 &&
+               static_cast<uint64_t>(data[index]) <= start + i) {
+      out[i] = static_cast<uint32_t>(data[index]);
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
 // A table scanned in row order: the ids are the rows, so `start` onwards, and
 // each parent refers to a row at or before its own. Copies the parents out,
 // nulls as kNoNode, or gives up on the first row which is not like that.
@@ -136,27 +182,34 @@ bool ParentsInOrder(const ColumnView& ids,
                     uint32_t count,
                     uint32_t start,
                     uint32_t* out) {
-  if (ids.kind() == ColumnView::Kind::kVariant || !ids.type().Is<Id>() ||
-      ids.validity() || !ids.selection().is_range() ||
-      ids.selection().offset() != start ||
-      parents.kind() == ColumnView::Kind::kVariant ||
-      !parents.type().Is<Uint32>()) {
+  if (ids.kind() == ColumnView::Kind::kVariant ||
+      parents.kind() == ColumnView::Kind::kVariant) {
     return false;
   }
-  const auto* data = static_cast<const uint32_t*>(parents.data());
-  const BitVector* validity = parents.validity();
-  RowSelection selection = parents.selection();
-  for (uint32_t i = 0; i < count; ++i) {
-    uint32_t index = selection.GetIndex(i);
-    if (validity && !validity->is_set(index)) {
-      out[i] = kNoNode;
-    } else if (data[index] <= start + i) {
-      out[i] = data[index];
-    } else {
-      return false;
-    }
+  bool ids_ok = false;
+  if (ids.type().Is<Id>()) {
+    ids_ok = !ids.validity() && ids.selection().is_range() &&
+             ids.selection().offset() == start;
+  } else if (ids.type().Is<Uint32>()) {
+    ids_ok = CheckSequentialIds<uint32_t>(ids, count, start);
+  } else if (ids.type().Is<Int32>()) {
+    ids_ok = CheckSequentialIds<int32_t>(ids, count, start);
+  } else if (ids.type().Is<Int64>()) {
+    ids_ok = CheckSequentialIds<int64_t>(ids, count, start);
   }
-  return true;
+  if (!ids_ok) {
+    return false;
+  }
+  if (parents.type().Is<Uint32>()) {
+    return ExtractParentsInOrder<uint32_t>(parents, count, start, out);
+  }
+  if (parents.type().Is<Int32>()) {
+    return ExtractParentsInOrder<int32_t>(parents, count, start, out);
+  }
+  if (parents.type().Is<Int64>()) {
+    return ExtractParentsInOrder<int64_t>(parents, count, start, out);
+  }
+  return false;
 }
 
 }  // namespace

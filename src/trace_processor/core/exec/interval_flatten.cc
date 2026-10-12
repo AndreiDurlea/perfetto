@@ -117,8 +117,10 @@ OpResult IntervalFlatten::Execute(const RowBatch& in,
     }
     s.input_pending = true;
   }
-  bool keyed = !spec_.key_columns.empty();
-  const ColumnView* groups = keyed ? &in.column(spec_.group_column) : nullptr;
+  bool grouped = spec_.group_column.has_value();
+  bool retain_keys = !spec_.key_columns.empty();
+  const ColumnView* groups =
+      grouped ? &in.column(*spec_.group_column) : nullptr;
   uint32_t rows = in.size();
   for (; s.input_row < rows; ++s.input_row) {
     uint32_t row = s.input_row;
@@ -132,7 +134,7 @@ OpResult IntervalFlatten::Execute(const RowBatch& in,
           base::ErrStatus("INTERVAL FLATTEN: a row's ts or dur is below zero");
       return OpResult::kError;
     }
-    uint32_t group = keyed ? groups->Value<uint32_t>(row) : 0;
+    uint32_t group = grouped ? groups->Value<uint32_t>(row) : 0;
     if (!s.in_group || group != s.input_group) {
       if (s.in_group) {
         // Finish the old group before accepting any rows from the new one.
@@ -166,7 +168,7 @@ OpResult IntervalFlatten::Execute(const RowBatch& in,
   s.input_row = 0;
   s.input_pending = false;
   // Only the current group's key must survive reuse of the input buffers.
-  if (keyed && s.in_group) {
+  if (retain_keys && s.in_group) {
     s.key_rows.View(&s.saved_key, s.key_row, 1);
   }
   return Yield(out, s, OpResult::kNeedMoreInput);

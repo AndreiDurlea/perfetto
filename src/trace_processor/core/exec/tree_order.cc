@@ -85,12 +85,45 @@ bool TreeChildFirst::Consume(const RowBatch& in, Breaker::State& state) const {
     return false;
   }
 
-  auto base = static_cast<uint32_t>(s.nodes.size());
+  uint32_t base = s.rows.size();
+  // Fast path: when rows up to `base` are densely numbered `0..base-1` and
+  // this batch is also densely numbered `base..base+count-1` with parents
+  // `< base + i` (or `kNoNode`), we can validate the entire batch without
+  // per-row bitvector checks or resizing.
+  if (s.nodes_seen == base && s.has_row.size() == base &&
+      !node_column->validity() && node_column->selection().is_range() &&
+      !parent_column->validity() && parent_column->selection().is_range()) {
+    const uint32_t* nodes =
+        static_cast<const uint32_t*>(node_column->data()) +
+        node_column->selection().offset();
+    const uint32_t* parents =
+        static_cast<const uint32_t*>(parent_column->data()) +
+        parent_column->selection().offset();
+    bool dense_parent_first = true;
+    bool has_any_parent = false;
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t n = nodes[i];
+      uint32_t p = parents[i];
+      if (n != base + i || (p != kNoNode && p >= base + i)) {
+        dense_parent_first = false;
+        break;
+      }
+      has_any_parent |= (p != kNoNode);
+    }
+    if (dense_parent_first) {
+      if (has_any_parent) {
+        s.child_first = false;
+      }
+      s.nodes_seen = base + count;
+      s.has_row.resize(s.nodes_seen, true);
+      s.status = s.rows.Append(in);
+      return s.status.ok();
+    }
+  }
+
   for (uint32_t i = 0; i < count; ++i) {
     uint32_t node = node_column->Value<uint32_t>(i);
     uint32_t parent = parent_column->Value<uint32_t>(i);
-    s.nodes.push_back(node);
-    s.parents.push_back(parent);
     if (node == parent) {
       s.status = base::ErrStatus("%s: a node is its own parent", kChildFirst);
       return false;
@@ -101,7 +134,6 @@ bool TreeChildFirst::Consume(const RowBatch& in, Breaker::State& state) const {
     }
     if (s.has_row.size() < s.nodes_seen) {
       s.has_row.resize(s.nodes_seen);
-      s.row_of_node.resize(s.nodes_seen);
     }
     if (s.has_row.is_set(node)) {
       s.status = base::ErrStatus("%s: more than one row has the same node",
@@ -118,7 +150,6 @@ bool TreeChildFirst::Consume(const RowBatch& in, Breaker::State& state) const {
       }
     }
     s.has_row.set(node);
-    s.row_of_node[node] = base + i;
   }
   s.status = s.rows.Append(in);
   return s.status.ok();
@@ -127,6 +158,28 @@ bool TreeChildFirst::Consume(const RowBatch& in, Breaker::State& state) const {
 bool TreeChildFirst::Sort(State& s) const {
   uint32_t nodes = s.nodes_seen;
   uint32_t rows = s.rows.size();
+  s.nodes.clear();
+  s.parents.clear();
+  s.nodes.reserve(rows);
+  s.parents.reserve(rows);
+  s.row_of_node.resize(nodes);
+
+  RowBatch batch;
+  uint32_t offset = 0;
+  while (offset < rows) {
+    uint32_t n = s.rows.View(&batch, offset, rows - offset);
+    const ColumnView& nc = batch.column(node_column_);
+    const ColumnView& pc = batch.column(parent_column_);
+    for (uint32_t i = 0; i < n; ++i) {
+      uint32_t node = nc.Value<uint32_t>(i);
+      uint32_t parent = pc.Value<uint32_t>(i);
+      s.nodes.push_back(node);
+      s.parents.push_back(parent);
+      s.row_of_node[node] = offset + i;
+    }
+    offset += n;
+  }
+
   // The children of every node, laid out end to end: a tree has as many
   // entries as it has non-roots.
   auto begin = FlexVector<uint32_t>::CreateFilled(nodes + 1, 0);
@@ -188,18 +241,9 @@ bool TreeChildFirst::Finalize(Breaker::State& state) const {
         kChildFirst);
     return false;
   }
-  if (s.child_first) {
-    // Already in the requested order, so no reordering is needed.
+  if (s.child_first || s.parent_first) {
+    // Either already in child-first order or reversed batch-by-batch in Serve.
     s.order.clear();
-    return true;
-  }
-  if (s.parent_first) {
-    // Reversing is all it takes to turn one tree order into the other.
-    uint32_t rows = s.rows.size();
-    s.order.resize(rows);
-    for (uint32_t row = 0; row < rows; ++row) {
-      s.order[row] = rows - 1 - row;
-    }
     return true;
   }
   return Sort(s);
@@ -210,10 +254,15 @@ bool TreeChildFirst::Serve(RowBatch& out, Breaker::State& state) const {
   if (s.emitted == s.rows.size()) {
     return false;
   }
-  uint32_t count = std::min(kMaxBatchRows, s.rows.size() - s.emitted);
+  uint32_t remaining = s.rows.size() - s.emitted;
+  uint32_t count = std::min(kMaxBatchRows, remaining);
   if (s.order.empty()) {
-    // A run never spans two chunks, so the store says how much it served.
-    count = s.rows.View(&out, s.emitted, count);
+    if (s.child_first) {
+      // A run never spans two chunks, so the store says how much it served.
+      count = s.rows.View(&out, s.emitted, count);
+    } else {
+      count = s.rows.ViewReverse(&out, remaining, count);
+    }
   } else {
     const uint32_t* begin = s.order.data() + s.emitted;
     count = s.rows.View(&out, Span<const uint32_t>(begin, begin + count));

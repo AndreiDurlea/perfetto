@@ -115,12 +115,6 @@ bool Add(AccumulateState& state, int64_t a, int64_t b, int64_t* out) {
   return false;
 }
 
-void Grow(std::vector<int64_t>* by_node, uint32_t node) {
-  if (by_node->size() <= node) {
-    by_node->resize(node + 1, 0);
-  }
-}
-
 // Appends a column of `totals` to `batch`.
 void Emit(RowBatch& batch, const std::shared_ptr<FlexVector<int64_t>>& totals) {
   ColumnView column =
@@ -164,24 +158,35 @@ bool TreeAccumulateUp::Process(RowBatch& batch, OperatorState& state) const {
   const int64_t* values =
       FlattenValues(batch.column(spec_.value_column), count, &s.value_scratch);
 
+  uint32_t max_node = 0;
+  for (uint32_t row = 0; row < count; ++row) {
+    max_node = std::max(max_node, nodes[row]);
+    uint32_t p = parents[row];
+    if (p != kNoNode) {
+      max_node = std::max(max_node, p);
+    }
+  }
+  if (count > 0 && s.by_node.size() <= max_node) {
+    s.by_node.resize(max_node + 1, 0);
+  }
+
   s.totals.reset();
   s.totals = s.buffers.Acquire();
   s.totals->resize(count);
-  int64_t* totals = s.totals->data();
+  int64_t* PERFETTO_RESTRICT totals = s.totals->data();
+  int64_t* PERFETTO_RESTRICT by_node = s.by_node.data();
   for (uint32_t row = 0; row < count; ++row) {
     uint32_t node = nodes[row];
-    Grow(&s.by_node, node);
     // Every descendant has already been seen and added its value here, so the
     // total is final the moment the node arrives.
     int64_t total;
-    if (!Add(s, values[row], s.by_node[node], &total)) {
+    if (PERFETTO_UNLIKELY(!Add(s, values[row], by_node[node], &total))) {
       return false;
     }
     totals[row] = total;
     uint32_t parent = parents[row];
     if (parent != kNoNode) {
-      Grow(&s.by_node, parent);
-      if (!Add(s, s.by_node[parent], total, &s.by_node[parent])) {
+      if (PERFETTO_UNLIKELY(!Add(s, by_node[parent], total, &by_node[parent]))) {
         return false;
       }
     }
@@ -204,24 +209,32 @@ bool TreeAccumulateDown::Process(RowBatch& batch, OperatorState& state) const {
   const int64_t* values =
       FlattenValues(batch.column(spec_.value_column), count, &s.value_scratch);
 
+  uint32_t max_node = 0;
+  for (uint32_t row = 0; row < count; ++row) {
+    max_node = std::max(max_node, nodes[row]);
+    uint32_t p = parents[row];
+    if (p != kNoNode) {
+      max_node = std::max(max_node, p);
+    }
+  }
+  if (count > 0 && s.by_node.size() <= max_node) {
+    s.by_node.resize(max_node + 1, 0);
+  }
+
   s.totals.reset();
   s.totals = s.buffers.Acquire();
   s.totals->resize(count);
-  int64_t* totals = s.totals->data();
+  int64_t* PERFETTO_RESTRICT totals = s.totals->data();
+  int64_t* PERFETTO_RESTRICT by_node = s.by_node.data();
   for (uint32_t row = 0; row < count; ++row) {
     uint32_t parent = parents[row];
-    int64_t above = 0;
-    if (parent != kNoNode) {
-      Grow(&s.by_node, parent);
-      above = s.by_node[parent];
-    }
+    int64_t above = parent != kNoNode ? by_node[parent] : 0;
     int64_t total;
-    if (!Add(s, values[row], above, &total)) {
+    if (PERFETTO_UNLIKELY(!Add(s, values[row], above, &total))) {
       return false;
     }
     uint32_t node = nodes[row];
-    Grow(&s.by_node, node);
-    s.by_node[node] = total;
+    by_node[node] = total;
     totals[row] = total;
   }
   Emit(batch, s.totals);

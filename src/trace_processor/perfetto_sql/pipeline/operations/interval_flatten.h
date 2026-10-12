@@ -62,6 +62,7 @@ class IntervalFlatten : public PlanOperation {
   ColumnId ts_ = 0;
   ColumnId dur_ = 0;
   std::vector<ColumnId> keys_;
+  std::vector<ColumnId> carried_keys_;
   std::vector<Aggregate> aggregates_;
   ColumnId out_ts_ = 0;
   ColumnId out_dur_ = 0;

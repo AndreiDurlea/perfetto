@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "perfetto/base/status.h"
@@ -41,8 +42,8 @@ struct IntervalFlattenSpec {
   uint32_t ts_column = 0;
   uint32_t dur_column = 0;
   std::vector<uint32_t> key_columns;
-  // As GroupBy appends. Unused without keys.
-  uint32_t group_column = 0;
+  // As GroupBy appends. Nullopt without partition keys.
+  std::optional<uint32_t> group_column;
   std::vector<Aggregate> aggregates;
 };
 

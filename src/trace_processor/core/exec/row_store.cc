@@ -93,6 +93,99 @@ uint32_t RowStore::View(RowBatch* out, uint32_t offset, uint32_t count) const {
   out->Slice(RowSelection::Range(offset - start), count);
   return count;
 }
+uint32_t RowStore::ViewReverse(RowBatch* out,
+                               uint32_t end_offset,
+                               uint32_t count) {
+  out->Reset();
+  count = std::min(count, std::min(end_offset, kMaxBatchRows));
+  if (!count) {
+    return 0;
+  }
+  uint32_t last_row = end_offset - 1;
+  uint32_t index = Find(last_row);
+  uint32_t batch_start = index ? ends_[index - 1] : 0;
+  count = std::min(count, last_row - batch_start + 1);
+  uint32_t first_in_batch = last_row - batch_start;
+
+  std::array<uint32_t, kMaxBatchRows> physical;
+  for (uint32_t c = 0; c < columns_.size(); ++c) {
+    auto& column = columns_[c];
+    const auto& batch = column.batches[index];
+    const auto& view = batch.view;
+    auto packed = column.buffers.Acquire();
+    const auto& sel = view.selection();
+    bool is_range = sel.is_range();
+    uint32_t range_last = sel.offset() + first_in_batch;
+    if (!is_range && (!c || !column.same_selection_as_previous)) {
+      for (uint32_t r = 0; r < count; ++r) {
+        physical[r] = sel.GetIndex(first_in_batch - r);
+      }
+    }
+    auto reverse_copy = [&](auto value) {
+      using T = decltype(value);
+      T* dest = packed->Values<T>().data();
+      auto* data = static_cast<const T*>(view.data());
+      if (is_range) {
+        if constexpr (std::is_same_v<T, uint32_t>) {
+          if (!data) {
+            for (uint32_t r = 0; r < count; ++r) {
+              dest[r] = range_last - r;
+            }
+            return;
+          }
+        }
+        const T* src_last = data + range_last;
+        for (uint32_t r = 0; r < count; ++r) {
+          dest[r] = src_last[-static_cast<int32_t>(r)];
+        }
+      } else {
+        for (uint32_t r = 0; r < count; ++r) {
+          if constexpr (std::is_same_v<T, uint32_t>) {
+            dest[r] = data ? data[physical[r]] : physical[r];
+          } else {
+            dest[r] = data[physical[r]];
+          }
+        }
+      }
+    };
+    if (view.kind() == ColumnView::Kind::kVariant) {
+      reverse_copy(Variant{});
+    } else if (view.type().Is<Id>() || view.type().Is<Uint32>()) {
+      reverse_copy(uint32_t{});
+    } else if (view.type().Is<Int32>()) {
+      reverse_copy(int32_t{});
+    } else if (view.type().Is<Int64>()) {
+      reverse_copy(int64_t{});
+    } else if (view.type().Is<Double>()) {
+      reverse_copy(double{});
+    } else {
+      reverse_copy(StringPool::Id{});
+    }
+    if (column.nullable) {
+      packed->validity.clear();
+      const auto* validity = view.validity();
+      if (!validity) {
+        packed->validity.resize(count, true);
+      } else {
+        for (uint32_t begin = 0; begin < count; begin += 64) {
+          uint64_t word = 0;
+          uint32_t end = std::min(begin + 64, count);
+          for (uint32_t r = begin; r < end; ++r) {
+            uint32_t phys = is_range ? (range_last - r) : physical[r];
+            bool valid = validity->is_set(phys);
+            word |= static_cast<uint64_t>(valid) << (r - begin);
+          }
+          packed->validity.AppendWord(word);
+        }
+        packed->validity.resize(count);
+      }
+    }
+    out->AddColumn(packed->View(view, column.nullable), packed);
+  }
+  out->SetCardinality(count);
+  return count;
+}
+
 uint32_t RowStore::View(RowBatch* out, Span<const uint32_t> rows) {
   out->Reset();
   uint32_t count =
@@ -107,10 +200,12 @@ uint32_t RowStore::View(RowBatch* out, Span<const uint32_t> rows) {
   std::array<Location, kMaxBatchRows> locations;
   uint32_t index = Find(rows[0]);
   uint32_t start = index ? ends_[index - 1] : 0;
+  bool single_batch = true;
   for (uint32_t r = 0; r < count; ++r) {
     if (rows[r] < start || rows[r] >= ends_[index]) {
       index = Find(rows[r]);
       start = index ? ends_[index - 1] : 0;
+      single_batch = false;
     }
     locations[r] = {index, rows[r] - start};
   }
@@ -118,10 +213,25 @@ uint32_t RowStore::View(RowBatch* out, Span<const uint32_t> rows) {
   for (uint32_t c = 0; c < columns_.size(); ++c) {
     auto& column = columns_[c];
     if (!c || !column.same_selection_as_previous) {
-      for (uint32_t r = 0; r < count; ++r) {
-        const auto& loc = locations[r];
-        physical[r] =
-            column.batches[loc.batch].view.selection().GetIndex(loc.row);
+      if (single_batch) {
+        const auto& sel = column.batches[locations[0].batch].view.selection();
+        if (sel.is_range()) {
+          uint32_t off = sel.offset();
+          for (uint32_t r = 0; r < count; ++r) {
+            physical[r] = off + locations[r].row;
+          }
+        } else {
+          const uint32_t* indices = sel.data();
+          for (uint32_t r = 0; r < count; ++r) {
+            physical[r] = indices[locations[r].row];
+          }
+        }
+      } else {
+        for (uint32_t r = 0; r < count; ++r) {
+          const auto& loc = locations[r];
+          physical[r] =
+              column.batches[loc.batch].view.selection().GetIndex(loc.row);
+        }
       }
     }
     const auto& first = column.batches[locations[0].batch];
@@ -130,6 +240,21 @@ uint32_t RowStore::View(RowBatch* out, Span<const uint32_t> rows) {
     auto gather = [&](auto value) {
       using T = decltype(value);
       T* dest = packed->Values<T>().data();
+      if (single_batch) {
+        auto* data = static_cast<const T*>(first.view.data());
+        if constexpr (std::is_same_v<T, uint32_t>) {
+          if (!data) {
+            for (uint32_t r = 0; r < count; ++r) {
+              dest[r] = physical[r];
+            }
+            return;
+          }
+        }
+        for (uint32_t r = 0; r < count; ++r) {
+          dest[r] = data[physical[r]];
+        }
+        return;
+      }
       for (uint32_t r = 0; r < count; ++r) {
         const auto& loc = locations[r];
         auto* data =

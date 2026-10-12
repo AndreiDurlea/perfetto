@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -145,12 +146,26 @@ bool Sort::Consume(const RowBatch& in, Breaker::State& state) const {
 bool Sort::Finalize(Breaker::State& state) const {
   auto& s = static_cast<State&>(state);
   uint32_t rows = s.rows.size();
+  uint32_t stride = s.layout.stride();
+  const uint8_t* keys = s.keys.data();
+  bool already_sorted = true;
+  for (uint32_t r = 1; r < rows; ++r) {
+    if (memcmp(keys + static_cast<size_t>(r - 1) * stride,
+               keys + static_cast<size_t>(r) * stride, stride) > 0) {
+      already_sorted = false;
+      break;
+    }
+  }
+  if (already_sorted) {
+    s.order.clear();
+    return true;
+  }
   s.order.resize(rows);
   std::iota(s.order.data(), s.order.data() + rows, 0u);
   Span<uint32_t> order(s.order.data(), s.order.data() + s.order.size());
   core::ops::SortRowLayout(
       Span<const uint8_t>(s.keys.data(), s.keys.data() + s.keys.size()),
-      s.layout.stride(), &order);
+      stride, &order);
   return true;
 }
 
@@ -160,8 +175,12 @@ bool Sort::Serve(RowBatch& out, Breaker::State& state) const {
     return false;
   }
   uint32_t count = std::min(kMaxBatchRows, s.rows.size() - s.emitted);
-  const uint32_t* begin = s.order.data() + s.emitted;
-  s.emitted += s.rows.View(&out, Span<const uint32_t>(begin, begin + count));
+  if (s.order.empty()) {
+    s.emitted += s.rows.View(&out, s.emitted, count);
+  } else {
+    const uint32_t* begin = s.order.data() + s.emitted;
+    s.emitted += s.rows.View(&out, Span<const uint32_t>(begin, begin + count));
+  }
   return true;
 }
 

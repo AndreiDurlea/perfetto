@@ -45,12 +45,103 @@ std::unique_ptr<Breaker::State> GroupBy::CreateState() const {
   return std::make_unique<State>();
 }
 
+namespace {
+
+bool IsIntKey(const ColumnView& column) {
+  if (column.kind() == ColumnView::Kind::kSequence) {
+    return true;
+  }
+  if (column.kind() != ColumnView::Kind::kFlat) {
+    return false;
+  }
+  StorageType t = column.type();
+  return t.Is<Uint32>() || t.Is<Int32>() || t.Is<Int64>();
+}
+
+}  // namespace
+
 bool GroupBy::Consume(const RowBatch& in, Breaker::State& state) const {
   auto& s = static_cast<State&>(state);
   uint32_t count = in.size();
   if (count == 0) {
     return true;
   }
+
+  if (key_columns_.size() == 1) {
+    const ColumnView& col = in.column(key_columns_[0]);
+    if (!s.int_key_mode) {
+      s.int_key_mode = IsIntKey(col) ? 1 : -1;
+    } else if (*s.int_key_mode == 1 && !IsIntKey(col)) {
+      s.status = base::ErrStatus(
+          "GROUP BY: key 1 must be a column holding one type");
+      return false;
+    }
+    if (*s.int_key_mode == 1) {
+      uint64_t at = s.groups.size();
+      s.groups.resize(at + count);
+      uint32_t* groups = s.groups.data() + at;
+      auto get_int_group = [&](int64_t val) -> uint32_t {
+        if (val >= 0 && val < 65536) {
+          auto uval = static_cast<uint32_t>(val);
+          if (PERFETTO_UNLIKELY(uval >= s.small_int_groups.size())) {
+            s.small_int_groups.resize(uval + 1, State::kNoGroup);
+          }
+          uint32_t g = s.small_int_groups[uval];
+          if (PERFETTO_UNLIKELY(g == State::kNoGroup)) {
+            g = s.num_groups++;
+            s.small_int_groups[uval] = g;
+          }
+          return g;
+        }
+        if (const uint32_t* found = s.int_group_of.Find(val)) {
+          return *found;
+        }
+        uint32_t g = s.num_groups++;
+        s.int_group_of.Insert(val, g);
+        return g;
+      };
+      auto get_null_group = [&]() -> uint32_t {
+        if (PERFETTO_UNLIKELY(s.null_group == State::kNoGroup)) {
+          s.null_group = s.num_groups++;
+        }
+        return s.null_group;
+      };
+      auto process_typed = [&](auto getter) {
+        const auto* validity = col.validity();
+        const auto& sel = col.selection();
+        if (!validity && sel.is_range()) {
+          uint32_t off = sel.offset();
+          for (uint32_t r = 0; r < count; ++r) {
+            groups[r] = get_int_group(getter(off + r));
+          }
+        } else {
+          for (uint32_t r = 0; r < count; ++r) {
+            uint32_t idx = sel.GetIndex(r);
+            if (validity && !validity->is_set(idx)) {
+              groups[r] = get_null_group();
+            } else {
+              groups[r] = get_int_group(getter(idx));
+            }
+          }
+        }
+      };
+      if (col.kind() == ColumnView::Kind::kSequence) {
+        process_typed([](uint32_t idx) { return static_cast<int64_t>(idx); });
+      } else if (col.type().Is<Uint32>()) {
+        const auto* d = static_cast<const uint32_t*>(col.data());
+        process_typed([d](uint32_t idx) { return static_cast<int64_t>(d[idx]); });
+      } else if (col.type().Is<Int32>()) {
+        const auto* d = static_cast<const int32_t*>(col.data());
+        process_typed([d](uint32_t idx) { return static_cast<int64_t>(d[idx]); });
+      } else {
+        const auto* d = static_cast<const int64_t*>(col.data());
+        process_typed([d](uint32_t idx) { return d[idx]; });
+      }
+      s.status = s.rows.Append(in);
+      return s.status.ok();
+    }
+  }
+
   if (std::optional<uint32_t> bad = s.keys.Encode(in, key_columns_)) {
     s.status = base::ErrStatus(
         "GROUP BY: key %u must be a column holding one type", *bad + 1);
@@ -65,7 +156,7 @@ bool GroupBy::Consume(const RowBatch& in, Breaker::State& state) const {
     if (const uint32_t* found = s.group_of.Find(key)) {
       group = *found;
     } else {
-      group = static_cast<uint32_t>(s.group_of.size());
+      group = s.num_groups++;
       void* copy;
       s.group_keys.Alloc(static_cast<uint32_t>(base::AlignUp<8>(key.size())),
                          &copy);
@@ -81,14 +172,30 @@ bool GroupBy::Consume(const RowBatch& in, Breaker::State& state) const {
 
 bool GroupBy::Finalize(Breaker::State& state) const {
   auto& s = static_cast<State&>(state);
-  // A counting sort on the group.
-  auto groups = static_cast<uint32_t>(s.group_of.size());
+  auto groups = s.num_groups;
   auto rows = static_cast<uint32_t>(s.groups.size());
+  const uint32_t* group_of_row = s.groups.data();
+
+  // Since group numbers are assigned in order of first appearance (0, 1, 2...),
+  // if `group_of_row` is non-decreasing then identical groups are already
+  // contiguous in arrival order!
+  bool already_grouped = true;
+  for (uint32_t r = 1; r < rows; ++r) {
+    if (group_of_row[r - 1] > group_of_row[r]) {
+      already_grouped = false;
+      break;
+    }
+  }
+  if (already_grouped) {
+    s.order.clear();
+    return true;
+  }
+
+  // A counting sort on the group.
   s.next.clear();
   s.next.push_back_multiple(0, groups);
   s.order.resize(rows);
   s.ordered_groups.resize(rows);
-  const uint32_t* group_of_row = s.groups.data();
   uint32_t* PERFETTO_RESTRICT next = s.next.data();
   uint32_t* PERFETTO_RESTRICT order = s.order.data();
   uint32_t* PERFETTO_RESTRICT ordered_groups = s.ordered_groups.data();
@@ -114,12 +221,20 @@ bool GroupBy::Serve(RowBatch& out, Breaker::State& state) const {
     return false;
   }
   uint32_t count = std::min(kMaxBatchRows, s.rows.size() - s.emitted);
-  const uint32_t* begin = s.order.data() + s.emitted;
-  count = s.rows.View(&out, Span<const uint32_t>(begin, begin + count));
-  ColumnView group =
-      ColumnView::Reference(StorageType{Uint32{}}, s.ordered_groups.data());
-  group.SetRange(s.emitted);
-  out.AddColumn(group);
+  if (s.order.empty()) {
+    count = s.rows.View(&out, s.emitted, count);
+    ColumnView group =
+        ColumnView::Reference(StorageType{Uint32{}}, s.groups.data());
+    group.SetRange(s.emitted);
+    out.AddColumn(group);
+  } else {
+    const uint32_t* begin = s.order.data() + s.emitted;
+    count = s.rows.View(&out, Span<const uint32_t>(begin, begin + count));
+    ColumnView group =
+        ColumnView::Reference(StorageType{Uint32{}}, s.ordered_groups.data());
+    group.SetRange(s.emitted);
+    out.AddColumn(group);
+  }
   s.emitted += count;
   return true;
 }
@@ -129,6 +244,11 @@ void GroupBy::State::Reset() {
   State& s = *this;
   s.group_of.Clear();
   s.group_keys.Clear();
+  s.int_key_mode = std::nullopt;
+  s.num_groups = 0;
+  s.null_group = kNoGroup;
+  s.small_int_groups.clear();
+  s.int_group_of.Clear();
   s.groups.clear();
   s.rows.Clear();
   s.order.clear();

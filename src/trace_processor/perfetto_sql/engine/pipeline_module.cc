@@ -432,4 +432,171 @@ int PipelineModule::Rowid(sqlite3_vtab_cursor* cursor, sqlite_int64*) {
                                  "no rowid");
 }
 
+namespace {
+
+template <typename T>
+bool AppendFlatColumn(dataframe::AdhocDataframeBuilder& builder,
+                      uint32_t col,
+                      const ColumnView& view,
+                      uint32_t count) {
+  const auto* data = static_cast<const T*>(view.data());
+  const auto* validity = view.validity();
+  const auto& sel = view.selection();
+  if (PERFETTO_LIKELY(!validity && sel.is_range())) {
+    return builder.PushNonNullSpan(col, data + sel.offset(), count);
+  }
+  if (!validity) {
+    const uint32_t* indices = sel.data();
+    for (uint32_t row = 0; row < count; ++row) {
+      if (!builder.PushNonNull(col, data[indices[row]])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  for (uint32_t row = 0; row < count; ++row) {
+    uint32_t index = sel.GetIndex(row);
+    if (!validity->is_set(index)) {
+      builder.PushNull(col);
+    } else if (!builder.PushNonNull(col, data[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool AppendColumnView(dataframe::AdhocDataframeBuilder& builder,
+                      uint32_t col,
+                      const ColumnView& view,
+                      uint32_t count) {
+  if (view.kind() == ColumnView::Kind::kVariant) {
+    for (uint32_t row = 0; row < count; ++row) {
+      Variant cell = view.Value<Variant>(row);
+      switch (cell.type) {
+        case Variant::Type::kNull:
+          builder.PushNull(col);
+          break;
+        case Variant::Type::kInt64:
+          if (!builder.PushNonNull(col, cell.AsInt64())) {
+            return false;
+          }
+          break;
+        case Variant::Type::kDouble:
+          if (!builder.PushNonNull(col, cell.AsDouble())) {
+            return false;
+          }
+          break;
+        case Variant::Type::kString:
+          if (!builder.PushNonNull(col, cell.AsString())) {
+            return false;
+          }
+          break;
+      }
+    }
+    return true;
+  }
+  if (view.kind() == ColumnView::Kind::kSequence) {
+    const auto* validity = view.validity();
+    const auto& sel = view.selection();
+    if (PERFETTO_LIKELY(!validity && sel.is_range())) {
+      return builder.PushSequenceSpan(col, sel.offset(), count);
+    }
+    for (uint32_t row = 0; row < count; ++row) {
+      uint32_t index = sel.GetIndex(row);
+      if (validity && !validity->is_set(index)) {
+        builder.PushNull(col);
+      } else if (!builder.PushNonNull(col, index)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  core::StorageType type = view.type();
+  if (type.Is<core::Uint32>()) {
+    return AppendFlatColumn<uint32_t>(builder, col, view, count);
+  }
+  if (type.Is<core::Int32>()) {
+    return AppendFlatColumn<int32_t>(builder, col, view, count);
+  }
+  if (type.Is<core::Int64>()) {
+    return AppendFlatColumn<int64_t>(builder, col, view, count);
+  }
+  if (type.Is<core::Double>()) {
+    return AppendFlatColumn<double>(builder, col, view, count);
+  }
+  if (type.Is<core::String>()) {
+    return AppendFlatColumn<StringPool::Id>(builder, col, view, count);
+  }
+  PERFETTO_FATAL("Unexpected column type");
+}
+
+}  // namespace
+
+base::StatusOr<dataframe::Dataframe> ExecutePipelineToDataframe(
+    const pipeline::LogicalPlan& plan,
+    PerfettoSqlConnection& connection,
+    StringPool* pool,
+    std::vector<std::string> column_names,
+    std::vector<dataframe::AdhocDataframeBuilder::ColumnType> column_types,
+    std::string_view error_context) {
+  pipeline::PlanWithDataframeArgs moved =
+      pipeline::MoveSqlSourcesToDataframeArgs(plan);
+  std::optional<SqliteConnection::PreparedStatement> args_stmt;
+  if (!moved.args.empty()) {
+    std::vector<std::string> dataframes;
+    dataframes.reserve(moved.args.size());
+    for (const std::string& arg : moved.args) {
+      dataframes.push_back("(" + arg + ")");
+    }
+    std::string sql = "SELECT " + std::string(pipeline::kDataframesFunction) +
+                      "(" + base::Join(dataframes, ", ") + ")";
+    ASSIGN_OR_RETURN(
+        args_stmt,
+        connection.PrepareSqliteStatement(
+            SqlSource::FromTraceProcessorImplementation(std::move(sql))));
+    args_stmt->Step();
+    RETURN_IF_ERROR(args_stmt->status());
+    const auto* list = sqlite::value::Pointer<DataframeList>(
+        sqlite3_column_value(args_stmt->sqlite_stmt(), 0),
+        kDataframesPointerType);
+    if (!list) {
+      return base::ErrStatus("__intrinsic_pipeline: expected dataframes");
+    }
+    std::vector<const dataframe::Dataframe*> inputs;
+    inputs.reserve(list->dataframes.size());
+    for (const SharedDataframe& input : list->dataframes) {
+      inputs.push_back(input.get());
+    }
+    RETURN_IF_ERROR(pipeline::BindDataframeArgs(moved.plan, inputs, pool));
+  }
+
+  std::unique_ptr<pipeline::PhysicalPlan> physical =
+      pipeline::Lower(moved.plan);
+  dataframe::AdhocDataframeBuilder::Options options;
+  options.types = std::move(column_types);
+  options.nullability_type = dataframe::NullabilityType::kSparseNull;
+  dataframe::AdhocDataframeBuilder builder(std::move(column_names), pool,
+                                           options);
+
+  const auto& columns = physical->columns();
+  auto state = physical->source().MakeState();
+  core::exec::RowBatch batch;
+  while (physical->source().GetData(batch, *state)) {
+    uint32_t count = batch.size();
+    if (count == 0) {
+      continue;
+    }
+    for (uint32_t c = 0; c < columns.size(); ++c) {
+      if (!AppendColumnView(builder, c, batch.column(columns[c].index),
+                            count)) {
+        return base::ErrStatus(
+            "%.*s: %s", static_cast<int>(error_context.size()),
+            error_context.data(), builder.status().c_message());
+      }
+    }
+  }
+  RETURN_IF_ERROR(physical->source().status(*state));
+  return std::move(builder).Build();
+}
+
 }  // namespace perfetto::trace_processor

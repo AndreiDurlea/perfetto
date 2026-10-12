@@ -155,7 +155,6 @@ base::StatusOr<Dataframe> AdhocDataframeBuilder::Build() && {
     } else if (state.storage->type().Is<Int64>()) {
       auto& data = state.storage->unchecked_get<Int64>();
       non_null_row_count = data.size();
-      duplicate_bit_vector_.clear();
 
       IntegerColumnSummary summary;
       summary.is_id_sorted = data.empty() || data[0] == 0;
@@ -163,18 +162,39 @@ base::StatusOr<Dataframe> AdhocDataframeBuilder::Build() && {
       summary.is_sorted = true;
       summary.min = data.empty() ? 0 : data[0];
       summary.max = data.empty() ? 0 : data[0];
-      summary.has_duplicates =
-          data.empty() ? false : CheckDuplicate(data[0], data.size());
       summary.is_nullable = state.null_overlay.has_value();
-      for (uint32_t j = 1; j < data.size(); ++j) {
-        summary.is_id_sorted = summary.is_id_sorted && (data[j] == j);
+
+      bool has_adjacent_equal = false;
+      const int64_t* ptr = data.data();
+      const uint32_t n = static_cast<uint32_t>(data.size());
+      for (uint32_t j = 1; j < n; ++j) {
+        int64_t prev = ptr[j - 1];
+        int64_t curr = ptr[j];
+        summary.is_id_sorted = summary.is_id_sorted && (curr == j);
         summary.is_setid_sorted =
-            summary.is_setid_sorted && (data[j] == data[j - 1] || data[j] == j);
-        summary.is_sorted = summary.is_sorted && data[j - 1] <= data[j];
-        summary.min = std::min(summary.min, data[j]);
-        summary.max = std::max(summary.max, data[j]);
-        summary.has_duplicates =
-            summary.has_duplicates || CheckDuplicate(data[j], data.size());
+            summary.is_setid_sorted && (curr == prev || curr == j);
+        summary.is_sorted = summary.is_sorted && (prev <= curr);
+        has_adjacent_equal = has_adjacent_equal || (prev == curr);
+        summary.min = std::min(summary.min, curr);
+        summary.max = std::max(summary.max, curr);
+      }
+
+      if (n == 0) {
+        summary.has_duplicates = false;
+      } else if (summary.min < 0 ||
+                 summary.max >= static_cast<int64_t>(16ll * n)) {
+        summary.has_duplicates = true;
+      } else if (summary.is_sorted) {
+        summary.has_duplicates = has_adjacent_equal;
+      } else {
+        duplicate_bit_vector_.clear();
+        summary.has_duplicates = false;
+        for (uint32_t j = 0; j < n; ++j) {
+          if (CheckDuplicate(ptr[j], n)) {
+            summary.has_duplicates = true;
+            break;
+          }
+        }
       }
       auto integer = CreateIntegerStorage(std::move(data), summary);
       SpecializedStorage specialized_storage =

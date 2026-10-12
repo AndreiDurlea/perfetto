@@ -163,6 +163,11 @@ class AdhocDataframeBuilder {
     return PushNonNullInternal(col, int64_t(value), count);
   }
   PERFETTO_ALWAYS_INLINE bool PushNonNull(uint32_t col,
+                                          int32_t value,
+                                          uint32_t count = 1) {
+    return PushNonNullInternal(col, int64_t(value), count);
+  }
+  PERFETTO_ALWAYS_INLINE bool PushNonNull(uint32_t col,
                                           int64_t value,
                                           uint32_t count = 1) {
     return PushNonNullInternal(col, value, count);
@@ -222,6 +227,131 @@ class AdhocDataframeBuilder {
       // since DenseNull stores all values (with nulls marked by the bitvector).
       AddPlaceholderValue(col, count);
     }
+  }
+
+  // Appends a contiguous span of `count` non-null values to `col`.
+  template <typename T>
+  bool PushNonNullSpan(uint32_t col, const T* values, uint32_t count) {
+    if (count == 0) {
+      return true;
+    }
+    auto& state = column_states_[col];
+    if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, uint32_t> ||
+                  std::is_same_v<T, int32_t>) {
+      if (!state.storage) {
+        state.storage = Storage{core::FlexVector<int64_t>{}};
+        if (state.null_overlay &&
+            state.nullability_type == NullabilityType::kDenseNull) {
+          state.storage->unchecked_get<Int64>().push_back_multiple(
+              int64_t{0}, static_cast<uint32_t>(state.null_overlay->size()));
+        }
+      }
+      if (PERFETTO_LIKELY(state.storage->type().Is<Int64>())) {
+        auto& vec = state.storage->unchecked_get<Int64>();
+        auto old_size = static_cast<uint32_t>(vec.size());
+        vec.resize(old_size + count);
+        int64_t* dst = vec.data() + old_size;
+        for (uint32_t i = 0; i < count; ++i) {
+          dst[i] = static_cast<int64_t>(values[i]);
+        }
+        if (PERFETTO_UNLIKELY(state.null_overlay)) {
+          state.null_overlay->push_back_multiple(true, count);
+        }
+        return true;
+      }
+    } else if constexpr (std::is_same_v<T, double>) {
+      if (!state.storage) {
+        state.storage = Storage{core::FlexVector<double>{}};
+        if (state.null_overlay &&
+            state.nullability_type == NullabilityType::kDenseNull) {
+          state.storage->unchecked_get<Double>().push_back_multiple(
+              0.0, static_cast<uint32_t>(state.null_overlay->size()));
+        }
+      }
+      if (PERFETTO_LIKELY(state.storage->type().Is<Double>())) {
+        auto& vec = state.storage->unchecked_get<Double>();
+        auto old_size = static_cast<uint32_t>(vec.size());
+        vec.resize(old_size + count);
+        double* dst = vec.data() + old_size;
+        for (uint32_t i = 0; i < count; ++i) {
+          dst[i] = values[i];
+        }
+        if (PERFETTO_UNLIKELY(state.null_overlay)) {
+          state.null_overlay->push_back_multiple(true, count);
+        }
+        return true;
+      }
+    } else if constexpr (std::is_same_v<T, StringPool::Id>) {
+      bool has_null = false;
+      for (uint32_t i = 0; i < count; ++i) {
+        has_null |= values[i].is_null();
+      }
+      if (PERFETTO_LIKELY(!has_null)) {
+        if (!state.storage) {
+          state.storage = Storage{core::FlexVector<StringPool::Id>{}};
+          if (state.null_overlay &&
+              state.nullability_type == NullabilityType::kDenseNull) {
+            state.storage->unchecked_get<String>().push_back_multiple(
+                StringPool::Id::Null(),
+                static_cast<uint32_t>(state.null_overlay->size()));
+          }
+        }
+        if (PERFETTO_LIKELY(state.storage->type().Is<String>())) {
+          auto& vec = state.storage->unchecked_get<String>();
+          auto old_size = static_cast<uint32_t>(vec.size());
+          vec.resize(old_size + count);
+          StringPool::Id* dst = vec.data() + old_size;
+          for (uint32_t i = 0; i < count; ++i) {
+            dst[i] = values[i];
+          }
+          if (PERFETTO_UNLIKELY(state.null_overlay)) {
+            state.null_overlay->push_back_multiple(true, count);
+          }
+          return true;
+        }
+      }
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+      if (!PushNonNull(col, values[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Appends a contiguous sequence `[start, start + count)` to `col`.
+  bool PushSequenceSpan(uint32_t col, uint32_t start, uint32_t count) {
+    if (count == 0) {
+      return true;
+    }
+    auto& state = column_states_[col];
+    if (!state.storage) {
+      state.storage = Storage{core::FlexVector<int64_t>{}};
+      if (state.null_overlay &&
+          state.nullability_type == NullabilityType::kDenseNull) {
+        state.storage->unchecked_get<Int64>().push_back_multiple(
+            int64_t{0}, static_cast<uint32_t>(state.null_overlay->size()));
+      }
+    }
+    if (PERFETTO_LIKELY(state.storage->type().Is<Int64>())) {
+      auto& vec = state.storage->unchecked_get<Int64>();
+      auto old_size = static_cast<uint32_t>(vec.size());
+      vec.resize(old_size + count);
+      int64_t* dst = vec.data() + old_size;
+      for (uint32_t i = 0; i < count; ++i) {
+        dst[i] = static_cast<int64_t>(start + i);
+      }
+      if (PERFETTO_UNLIKELY(state.null_overlay)) {
+        state.null_overlay->push_back_multiple(true, count);
+      }
+      return true;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+      if (!PushNonNull(col, start + i)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   // Appends `count` placeholder values to the specified column `col`.
