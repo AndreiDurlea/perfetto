@@ -327,7 +327,9 @@ CREATE PERFETTO TABLE android_cuj_blocking_calls(
   -- Thread utid.
   utid JOINID(thread.id),
   -- Type of CUJ, i.e. jank or latency.
-  cuj_type STRING
+  cuj_type STRING,
+  -- Whether the blocking call occurred on the CUJ's UI thread.
+  is_ui_thread BOOL
 )
 AS
 WITH
@@ -335,7 +337,15 @@ WITH
   -- so the join against `_android_critical_blocking_calls` uses a direct
   -- equality condition on `(upid, utid)` rather than an `OR` across two tables.
   cuj_threads AS (
-    SELECT cuj_id, cuj_name, cuj_type, upid, ts, ts_end, ui_thread AS utid
+    SELECT
+      cuj_id,
+      cuj_name,
+      cuj_type,
+      upid,
+      ts,
+      ts_end,
+      ui_thread AS utid,
+      TRUE AS is_ui_thread
     FROM android_jank_latency_cujs
     WHERE
       ui_thread IS NOT NULL
@@ -350,7 +360,8 @@ WITH
       cuj.upid,
       cuj.ts,
       cuj.ts_end,
-      rt.render_thread_utid AS utid
+      rt.render_thread_utid AS utid,
+      FALSE AS is_ui_thread
     FROM android_jank_latency_cujs AS cuj
     JOIN _render_thread_per_process AS rt
       ON rt.upid = cuj.upid
@@ -369,7 +380,8 @@ SELECT
   s.process_name,
   s.upid,
   s.utid,
-  cuj.cuj_type
+  cuj.cuj_type,
+  cuj.is_ui_thread
 FROM cuj_threads AS cuj
 JOIN _android_critical_blocking_calls AS s
   ON s.utid = cuj.utid
