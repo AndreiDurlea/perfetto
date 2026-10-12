@@ -23,6 +23,7 @@ import {SplitPanel} from '../../widgets/split_panel';
 import {Stack, StackAuto} from '../../widgets/stack';
 import {Switch} from '../../widgets/switch';
 import {TextInput} from '../../widgets/text_input';
+import {showModal} from '../../widgets/modal';
 import {InMemoryDataSource} from '../../components/widgets/datagrid/in_memory_data_source';
 import {getBigtraceEndpoint} from '../settings/endpoint_storage';
 import {BigtraceAsyncDataSource} from '../query/bigtrace_async_data_source';
@@ -33,8 +34,8 @@ import {
   type BigTraceEditorTab,
   type QueryTabsState,
   applyModeDefaults,
-  hasQueryText,
   effectiveTabSettings,
+  hasQueryText,
 } from './query_tabs_state';
 import {openQuerySettingsModal} from './query_settings_modal';
 import {renderResultsPanel} from './results_panel';
@@ -68,7 +69,10 @@ export class EditorTabView implements m.ClassComponent<EditorTabViewAttrs> {
     // A tab with no configuration yet shows the launcher instead of the editor:
     // every query starts from a preset or a deliberate custom setup. A
     // configured tab shows it too while its Settings are open.
-    if (!tab.configured || tab.settingsSession !== undefined) {
+    if (
+      tab.queryEngine !== 'duckdb' &&
+      (!tab.configured || tab.settingsSession !== undefined)
+    ) {
       return m(
         '.pf-bt-editor-tab',
         m(QueryLauncher, {
@@ -80,11 +84,12 @@ export class EditorTabView implements m.ClassComponent<EditorTabViewAttrs> {
     }
 
     return m('.pf-bt-editor-tab', [
-      m(BigtraceSettingsBar, {
-        tab,
-        tabsState,
-        bindings: buildTabBindings(tab, tabsState),
-      }),
+      tab.queryEngine !== 'duckdb' &&
+        m(BigtraceSettingsBar, {
+          tab,
+          tabsState,
+          bindings: buildTabBindings(tab, tabsState),
+        }),
       m(SplitPanel, {
         direction: 'vertical',
         initialSplit: {percent: 22},
@@ -156,15 +161,17 @@ function buildTabBindings(
     },
     getRowLimit: () => tab.limit,
     setRowLimit: (limit) => {
-      tab.limit = limit;
-      tabsState.markDirty();
+      if (limit >= 0) {
+        tab.limit = limit;
+        tabsState.saveNow();
+      }
     },
     getMaterialize: () => tab.materialize,
     setMaterialize: (materialize) => {
       // Same path as the toolbar switch: caps the user never touched follow
       // the mode.
       applyModeDefaults(tab, materialize);
-      tabsState.markDirty();
+      tabsState.saveNow();
     },
     getExperimentFilter: () => tab.experimentFilter,
     setExperimentFilter: (filter) => {
@@ -173,9 +180,9 @@ function buildTabBindings(
     },
     getTraceLimit: () => tab.traceLimit,
     setTraceLimit: (limit) => {
-      if (limit > 0) {
+      if (limit >= 0) {
         tab.traceLimit = limit;
-        tabsState.markDirty();
+        tabsState.saveNow();
       }
     },
     getTableTtlDays: () => tab.tableTtlDays,
@@ -202,8 +209,110 @@ async function formatTabQuery(
   m.redraw();
 }
 
+// Checks if running `query` on `tab` would overwrite an existing result table
+// (or this tab's previous run) and shows a Perfetto modal offering to either
+// overwrite in place or create and run in a new tab with `<name>_1` (editable).
+async function runTabWithOverwriteCheck(
+  tab: BigTraceEditorTab,
+  tabsState: QueryTabsState,
+  runner: QueryRunner,
+  query: string,
+): Promise<void> {
+  if (!hasQueryText(query)) return;
+  const endpoint = getBigtraceEndpoint().trim();
+  const baseName = (tab.tableName.trim() || tab.title.trim()).replace(
+    /[^A-Za-z0-9_]/g,
+    '_',
+  );
+  const hasMaterializedResult =
+    tab.execution?.status === 'SUCCESS' &&
+    Boolean(tab.execution.tableName) &&
+    (tab.execution.processedRows ?? 0) > 0;
+
+  let tableExists = hasMaterializedResult;
+  let resolvedName = baseName || 'tbl';
+  let suggestedName = `${resolvedName}_1`;
+
+  if (endpoint !== '' && baseName !== '') {
+    try {
+      const client = new BigtraceQueryClient(endpoint);
+      const check = await client.checkTableExists(baseName);
+      tableExists = check.exists;
+      if (check.resolvedTableName) resolvedName = check.resolvedTableName;
+      if (check.suggestedTableName) {
+        suggestedName = check.suggestedTableName;
+      } else {
+        suggestedName = `${resolvedName}_1`;
+      }
+    } catch {
+      // Fall back to local materialized state if the preflight check fails.
+    }
+  }
+
+  if (!tableExists) {
+    await runner.run(tab, query);
+    return;
+  }
+
+  let newTableName = suggestedName;
+  let choice = 'cancel' as 'cancel' | 'overwrite' | 'new_tab';
+
+  await showModal({
+    title: `Table "${resolvedName}" already exists`,
+    content: () =>
+      m(
+        Stack,
+        {orientation: 'vertical', gap: 'normal'},
+        m(
+          'div',
+          'Running in this tab will overwrite it, or you can create a new tab with the suggested table name below:',
+        ),
+        m(TextInput, {
+          value: newTableName,
+          placeholder: suggestedName,
+          autofocus: true,
+          onInput: (val: string) => {
+            newTableName = val;
+          },
+        }),
+      ),
+    buttons: [
+      {
+        text: 'Cancel',
+        action: () => {
+          choice = 'cancel';
+        },
+      },
+      {
+        text: 'Overwrite',
+        action: () => {
+          choice = 'overwrite';
+        },
+      },
+      {
+        text: 'Create New Tab',
+        primary: true,
+        action: () => {
+          choice = 'new_tab';
+        },
+      },
+    ],
+  });
+
+  if (choice === 'overwrite') {
+    await runner.run(tab, query);
+  } else if (choice === 'new_tab') {
+    const chosenName = newTableName.trim() || suggestedName;
+    const newTab = tabsState.cloneTab(tab.id, chosenName, query);
+    m.redraw();
+    if (newTab) {
+      await runner.run(newTab, query);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Editor panel: toolbar (Run/Cancel + limit + Persistent) and the editor.
+// Editor panel: toolbar (Run/Cancel + limit)
 // ---------------------------------------------------------------------------
 
 function renderEditorPanel(
@@ -212,6 +321,8 @@ function renderEditorPanel(
   runner: QueryRunner,
   useBigtraceBackend: boolean,
 ): m.Children {
+  const isDuckdb = tab.queryEngine === 'duckdb';
+  const canRun = hasQueryText(tab.editorText);
   return m('.pf-bt-query-page__editor-panel', [
     m(Box, {className: 'pf-bt-query-page__toolbar'}, [
       m(Stack, {orientation: 'horizontal'}, [
@@ -228,8 +339,14 @@ function renderEditorPanel(
               icon: 'play_arrow',
               intent: Intent.Primary,
               variant: ButtonVariant.Filled,
-              disabled: !hasQueryText(tab.editorText),
-              onclick: () => runner.run(tab, tab.editorText),
+              disabled: !canRun,
+              onclick: () =>
+                void runTabWithOverwriteCheck(
+                  tab,
+                  tabsState,
+                  runner,
+                  tab.editorText,
+                ),
             }),
         m(
           Stack,
@@ -249,7 +366,8 @@ function renderEditorPanel(
         useBigtraceBackend && renderRunControls(tab, tabsState),
       ]),
     ]),
-    tab.editorText.includes('"') &&
+    !isDuckdb &&
+      tab.editorText.includes('"') &&
       m(
         Callout,
         {icon: 'warning', intent: Intent.None},
@@ -268,15 +386,13 @@ function renderEditorPanel(
         tab.editorText = text;
         tabsState.markDirty();
       },
-      onExecute: (query: string) => runner.run(tab, query),
+      onExecute: (query: string) =>
+        void runTabWithOverwriteCheck(tab, tabsState, runner, query),
     }),
   ]);
 }
 
-// Mode switch, the row cap, and the gear opening the query-settings modal
-// (the trace cap and every non-trace-selection setting). The gear is always
-// there: the trace cap is a universal request field, whatever the backend
-// declares.
+// Persistent switch, row cap, and settings.
 function renderRunControls(
   tab: BigTraceEditorTab,
   tabsState: QueryTabsState,
@@ -300,13 +416,18 @@ function renderRunControls(
       type: 'number',
       className: 'pf-bt-limit-input',
       value: String(tab.limit),
-      title: 'Maximum rows this query returns.',
+      title: 'Maximum rows this query returns (0 = unlimited).',
       disabled: tab.isLoading,
       onInput: (value: string) => {
+        if (value.trim() === '') {
+          tab.limit = 0;
+          tabsState.saveNow();
+          return;
+        }
         const newLimit = parseInt(value, 10);
-        if (!isNaN(newLimit) && newLimit > 0) {
+        if (!isNaN(newLimit) && newLimit >= 0) {
           tab.limit = newLimit;
-          tabsState.markDirty();
+          tabsState.saveNow();
         }
       },
     }),

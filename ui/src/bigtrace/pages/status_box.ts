@@ -15,8 +15,6 @@
 import m from 'mithril';
 import {Box} from '../../widgets/box';
 import {Button} from '../../widgets/button';
-import {PopupPosition} from '../../widgets/popup';
-import {Tooltip} from '../../widgets/tooltip';
 import {Duration} from '../../base/time';
 import {BigtraceAsyncDataSource} from '../query/bigtrace_async_data_source';
 import {
@@ -34,9 +32,10 @@ export function formatDurationS(ms: number): string {
 }
 
 export function renderStatusBox(tab: BigTraceEditorTab): m.Children {
-  if (!tab.materialize || !tab.queryUuid) return false;
+  if (!tab.materialize || (!tab.queryUuid && !tab.isLoading)) return false;
 
   const isTerminal =
+    !tab.isLoading &&
     tab.execution?.status !== undefined &&
     TERMINAL_STATUSES.has(tab.execution.status);
   const processedRows = tab.execution?.processedRows ?? 0;
@@ -59,7 +58,8 @@ export function renderStatusBox(tab: BigTraceEditorTab): m.Children {
     }
   }
 
-  const status = tab.execution?.status ?? 'UNKNOWN';
+  const status =
+    tab.execution?.status ?? (tab.isLoading ? 'IN_PROGRESS' : 'UNKNOWN');
   const processedTraces = tab.execution?.processedTraces ?? 0;
   const totalTraces = tab.execution?.totalTraces ?? 0;
   const durationStr = formatDurationS(durationMs);
@@ -98,25 +98,29 @@ export function renderStatusBox(tab: BigTraceEditorTab): m.Children {
   ]
     .filter(Boolean)
     .join(' ');
+  const isDuckdb = tab.queryEngine === 'duckdb';
   const rightGroupContent = m(
     '.pf-bt-status-bar-group',
-    m(
-      'span.pf-bt-status-bar-stat.pf-bt-status-bar-stat--traces',
-      m('span.pf-bt-status-bar-stat-label', 'Traces:'),
+    !isDuckdb &&
       m(
-        'span.pf-bt-status-bar-stat-value',
-        {
-          title:
-            `${processedTraces.toLocaleString()} of ` +
-            `${totalTraces.toLocaleString()}` +
-            (!isTerminal
-              ? ' — numerator lags the poll (≤3s); denominator is exact.'
-              : ''),
-        },
-        formatCompact(processedTraces),
+        'span.pf-bt-status-bar-stat.pf-bt-status-bar-stat--traces',
+        m('span.pf-bt-status-bar-stat-label', 'Traces:'),
+        m(
+          'span.pf-bt-status-bar-stat-value',
+          {
+            title:
+              `${processedTraces.toLocaleString()} of ` +
+              `${totalTraces.toLocaleString()}` +
+              (!isTerminal
+                ? ' — numerator lags the poll (≤3s); denominator is exact.'
+                : ''),
+          },
+          !isTerminal && totalTraces > 0
+            ? `${formatCompact(processedTraces)} / ${formatCompact(totalTraces)}`
+            : formatCompact(processedTraces),
+        ),
+        renderInlineProgressBar(processedTraces, totalTraces, !isTerminal),
       ),
-      renderInlineProgressBar(processedTraces, totalTraces, !isTerminal),
-    ),
     m(
       'span',
       {className: rowsStatClasses},
@@ -124,28 +128,20 @@ export function renderStatusBox(tab: BigTraceEditorTab): m.Children {
       m(
         'span.pf-bt-status-bar-stat-value',
         {
-          title: `${processedRows.toLocaleString()} of result limit ${tab.limit.toLocaleString()}`,
+          title:
+            tab.limit > 0
+              ? `${processedRows.toLocaleString()} of result limit ${tab.limit.toLocaleString()}`
+              : `${processedRows.toLocaleString()} rows (no limit)`,
         },
         formatCompact(processedRows),
       ),
-      renderInlineProgressBar(processedRows, tab.limit, !isTerminal),
+      renderInlineProgressBar(
+        processedRows,
+        tab.limit,
+        !isTerminal && isDuckdb,
+      ),
     ),
   );
-
-  const rightGroup = !isTerminal
-    ? m(
-        Tooltip,
-        {
-          trigger: rightGroupContent,
-          position: PopupPosition.Top,
-        },
-        m(
-          '.pf-bt-status-bar-progress-tooltip',
-          m('div', `Traces: ${formatCompact(processedTraces)}`),
-          m('div', `Rows: ${formatCompact(processedRows)}`),
-        ),
-      )
-    : rightGroupContent;
 
   return m(
     Box,
@@ -155,7 +151,7 @@ export function renderStatusBox(tab: BigTraceEditorTab): m.Children {
         : 'pf-bt-status-bar pf-bt-status-bar--running',
     },
     leftGroup,
-    rightGroup,
+    rightGroupContent,
   );
 }
 
@@ -165,7 +161,14 @@ function renderInlineProgressBar(
   live: boolean,
 ): m.Children {
   if (!live) return null;
-  if (total <= 0) return null;
+  if (total <= 0 || done <= 0) {
+    return m(
+      'span.pf-bt-inline-progress',
+      m(
+        'span.pf-bt-inline-progress-fill.pf-bt-inline-progress-fill--indeterminate',
+      ),
+    );
+  }
   const pct = Math.max(0, Math.min(100, (done / total) * 100));
   return m(
     'span.pf-bt-inline-progress',

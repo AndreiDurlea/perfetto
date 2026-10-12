@@ -17,8 +17,10 @@ import {z} from 'zod';
 import {
   applyModeDefaults,
   applyPresetSetup,
+  canRenameTab,
   closeSettings,
   isTraceSelectionSetting,
+  makeQueryResponse,
   parseTraceUuids,
   setTraceUuidsActive,
   TRACE_UUIDS_SETTING_ID,
@@ -31,6 +33,7 @@ import {
   QueryTabsState,
   restoreTabConfig,
   snapshotTabConfig,
+  stageDuckdbQuery,
   type BigTraceEditorTab,
 } from './query_tabs_state';
 import {bigTraceSettingsStorage} from '../settings/bigtrace_settings_storage';
@@ -252,14 +255,20 @@ describe('per-mode row and trace limits', () => {
       undefined,
       true,
     );
-    tab.traceLimit = 123;
+    tab.limit = 0;
+    tab.traceLimit = 0;
     tab.tableTtlDays = 45;
     (tabs as unknown as {saveToStorage: () => void}).saveToStorage();
-    const restored = new QueryTabsState().tabs.find(
+    const restoredState = new QueryTabsState();
+    const restored = restoredState.tabs.find(
       (t) => t.editorText === 'select 1',
     )!;
-    expect(restored.traceLimit).toBe(123);
+    expect(restored.limit).toBe(0);
+    expect(restored.traceLimit).toBe(0);
     expect(restored.tableTtlDays).toBe(45);
+    const cloned = restoredState.cloneTab(restored.id)!;
+    expect(cloned.limit).toBe(0);
+    expect(cloned.traceLimit).toBe(0);
   });
 });
 
@@ -282,7 +291,8 @@ describe('cloneTab', () => {
 
   function configuredTab(tabs: QueryTabsState) {
     const tab = tabs.addNewTab(undefined, '', undefined, undefined, true);
-    tab.title = 'Jank by device';
+    tab.title = 'jank_by_device';
+    tab.tableName = 'jank_by_device';
     tab.editorText = 'select * from slice';
     tab.configured = true;
     tab.queryUuid = 'uuid-1';
@@ -330,10 +340,12 @@ describe('cloneTab', () => {
     expect(clone.isLoading).toBe(false);
   });
 
-  test('a clone is a new tab, named like one', () => {
+  test('a clone is a new tab, named with a fresh default table name', () => {
     const tabs = new QueryTabsState();
     const src = configuredTab(tabs);
-    expect(tabs.cloneTab(src.id)?.title).toMatch(/^Query \d+$/);
+    const clone = tabs.cloneTab(src.id)!;
+    expect(clone.title).toMatch(/^tbl_[a-z0-9]+$/);
+    expect(clone.tableName).toBe(clone.title);
   });
 
   test('editing the clone leaves the original alone', () => {
@@ -366,7 +378,7 @@ describe('cloneTab', () => {
     expect(tabs.cloneTab(src.id)?.lastPresetId).toBe('local:sweep');
     (tabs as unknown as {saveToStorage: () => void}).saveToStorage();
     const restored = new QueryTabsState().tabs.find(
-      (t) => t.title === 'Jank by device',
+      (t) => t.title === 'jank_by_device',
     )!;
     expect(restored.lastPresetId).toBe('local:sweep');
   });
@@ -809,5 +821,198 @@ describe('experiment filter', () => {
       isTreatment: true,
     });
     expect(tab.experimentFilter?.experimentName).toBeUndefined();
+  });
+});
+
+describe('stageDuckdbQuery (open a table in DuckDB from History)', () => {
+  const SQL = 'SELECT *\nFROM result_1\nLIMIT 1000;\n';
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  test('switches an empty active tab to DuckDB mode without running', () => {
+    const tabs = new QueryTabsState();
+    const active = tabs.getActiveTab()!;
+    const tab = stageDuckdbQuery(tabs, SQL, 1000);
+    expect(tab).toBe(active);
+    expect(tabs.tabs.length).toBe(1);
+    expect(tab.queryEngine).toBe('duckdb');
+    expect(tab.configured).toBe(true);
+    expect(tab.editorText).toBe(SQL);
+    expect(tab.limit).toBe(1000);
+    expect(tab.isLoading).toBe(false);
+    expect(tab.queryUuid).toBeUndefined();
+  });
+
+  test('never overwrites a tab that already holds SQL', () => {
+    const tabs = new QueryTabsState();
+    const active = tabs.getActiveTab()!;
+    active.editorText = 'SELECT * FROM slice';
+    const tab = stageDuckdbQuery(tabs, SQL);
+    expect(tab).not.toBe(active);
+    expect(active.editorText).toBe('SELECT * FROM slice');
+    expect(active.queryEngine).toBe('traces');
+    expect(tabs.activeTabId).toBe(tab.id);
+    expect(tab.queryEngine).toBe('duckdb');
+  });
+
+  test('leaves a running tab alone', () => {
+    const tabs = new QueryTabsState();
+    const active = tabs.getActiveTab()!;
+    active.isLoading = true;
+    const tab = stageDuckdbQuery(tabs, SQL);
+    expect(tab).not.toBe(active);
+    expect(active.queryEngine).toBe('traces');
+  });
+
+  test('repeated clicks reuse the staged tab', () => {
+    const tabs = new QueryTabsState();
+    tabs.getActiveTab()!.editorText = 'SELECT 1';
+    const first = stageDuckdbQuery(tabs, SQL);
+    const count = tabs.tabs.length;
+    tabs.activeTabId = tabs.tabs[0].id;
+    expect(stageDuckdbQuery(tabs, SQL)).toBe(first);
+    expect(tabs.tabs.length).toBe(count);
+  });
+
+  test('closes an open Settings session', () => {
+    const tabs = new QueryTabsState();
+    const active = tabs.getActiveTab()!;
+    openSettings(active);
+    stageDuckdbQuery(tabs, SQL);
+    expect(active.settingsSession).toBeUndefined();
+  });
+});
+
+describe('Tab title and table name unification', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  test('new tab initializes with a default UUID table name for both title and tableName', () => {
+    const tabs = new QueryTabsState();
+    const tab = tabs.getActiveTab()!;
+    expect(tab.title).toMatch(/^tbl_[a-z0-9]+$/);
+    expect(tab.tableName).toBe(tab.title);
+    expect(canRenameTab(tab)).toBe(true);
+  });
+
+  test('renameTab before running a query sets both title and tableName and persists', () => {
+    const tabs1 = new QueryTabsState();
+    const tab = tabs1.getActiveTab()!;
+    tab.editorText = 'SELECT * FROM slice';
+    tabs1.renameTab(tab.id, '  slices  ');
+    expect(tab.title).toBe('slices');
+    expect(tab.tableName).toBe('slices');
+
+    (tabs1 as unknown as {saveToStorage: () => void}).saveToStorage();
+
+    const tabs2 = new QueryTabsState();
+    expect(tabs2.tabs).toHaveLength(1);
+    expect(tabs2.tabs[0].title).toBe('slices');
+    expect(tabs2.tabs[0].tableName).toBe('slices');
+  });
+
+  test('renameTab is blocked while loading or after a query has run', () => {
+    const tabs = new QueryTabsState();
+    const tab = tabs.getActiveTab()!;
+    tabs.renameTab(tab.id, 'initial_name');
+    expect(tab.title).toBe('initial_name');
+
+    // Blocked while loading
+    tab.isLoading = true;
+    expect(canRenameTab(tab)).toBe(false);
+    tabs.renameTab(tab.id, 'while_loading');
+    expect(tab.title).toBe('initial_name');
+    expect(tab.tableName).toBe('initial_name');
+
+    // Blocked once queryUuid is set
+    tab.isLoading = false;
+    tab.queryUuid = 'exec-uuid-1';
+    expect(canRenameTab(tab)).toBe(false);
+    tabs.renameTab(tab.id, 'after_uuid');
+    expect(tab.title).toBe('initial_name');
+    expect(tab.tableName).toBe('initial_name');
+
+    // Blocked once queryResult is set
+    tab.queryUuid = undefined;
+    tab.queryResult = makeQueryResponse('SELECT 1');
+    expect(canRenameTab(tab)).toBe(false);
+    tabs.renameTab(tab.id, 'after_result');
+    expect(tab.title).toBe('initial_name');
+    expect(tab.tableName).toBe('initial_name');
+  });
+});
+
+describe('Top-level engine mode (Traces vs Analysis)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  test('setEngine switches visible tabs and creates a tab if none exist in that mode', () => {
+    const tabs = new QueryTabsState();
+    const tracesTab = tabs.getActiveTab()!;
+    expect(tabs.activeEngine).toBe('traces');
+    expect(tabs.getVisibleTabs()).toEqual([tracesTab]);
+
+    // Switch to Analysis (duckdb): creates a new duckdb tab automatically
+    tabs.setEngine('duckdb');
+    expect(tabs.activeEngine).toBe('duckdb');
+    const analysisTab = tabs.getActiveTab()!;
+    expect(analysisTab.id).not.toBe(tracesTab.id);
+    expect(analysisTab.queryEngine).toBe('duckdb');
+    expect(analysisTab.configured).toBe(true);
+    expect(tabs.getVisibleTabs()).toEqual([analysisTab]);
+
+    // New tab in Analysis mode creates another duckdb tab
+    const analysisTab2 = tabs.addNewTab(
+      undefined,
+      'SELECT 1',
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
+    expect(analysisTab2.queryEngine).toBe('duckdb');
+    expect(tabs.getVisibleTabs()).toEqual([analysisTab, analysisTab2]);
+
+    // Switch back to Traces: restores the original tracesTab and shows only traces tabs
+    tabs.setEngine('traces');
+    expect(tabs.activeEngine).toBe('traces');
+    expect(tabs.getActiveTab()).toBe(tracesTab);
+    expect(tabs.getVisibleTabs()).toEqual([tracesTab]);
+
+    // Switch to Analysis again: restores the last active analysis tab (analysisTab2)
+    tabs.setEngine('duckdb');
+    expect(tabs.getActiveTab()).toBe(analysisTab2);
+  });
+
+  test('closeTab is scoped to the tab engine and never closes the last tab in that engine', () => {
+    const tabs = new QueryTabsState();
+    const tracesTab = tabs.getActiveTab()!;
+    tabs.setEngine('duckdb');
+    const analysisTab1 = tabs.getActiveTab()!;
+    const analysisTab2 = tabs.addNewTab(
+      undefined,
+      'SELECT 2',
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
+
+    // Cannot close the only traces tab even though total tabs.length is 3
+    tabs.closeTab(tracesTab.id);
+    expect(tabs.tabs).toContain(tracesTab);
+
+    // Closing analysisTab2 activates analysisTab1 (not tracesTab)
+    tabs.closeTab(analysisTab2.id);
+    expect(tabs.getActiveTab()).toBe(analysisTab1);
+    expect(tabs.getVisibleTabs()).toEqual([analysisTab1]);
+
+    // Cannot close the last remaining analysis tab
+    tabs.closeTab(analysisTab1.id);
+    expect(tabs.getVisibleTabs()).toEqual([analysisTab1]);
   });
 });

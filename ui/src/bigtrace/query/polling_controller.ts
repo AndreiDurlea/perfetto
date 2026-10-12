@@ -13,13 +13,13 @@
 // limitations under the License.
 
 import {BigtraceAsyncDataSource} from './bigtrace_async_data_source';
-import {QueryNotFoundError} from './bigtrace_query_client';
+import {QueryCancelledError, QueryNotFoundError} from './bigtrace_query_client';
 import {isoToEpochMs, type RawQueryExecution} from './query_history_storage';
 import {queryStore, TERMINAL_STATUSES} from './query_store';
 import {makeQueryResponse} from '../pages/query_tabs_state';
 import type {BigTraceEditorTab} from '../pages/query_tabs_state';
 
-const POLL_INTERVAL_MS = 3000;
+const POLL_INTERVAL_MS = 500;
 const POLL_RETRY_MS = 1000;
 
 export interface PollingCallbacks {
@@ -57,13 +57,20 @@ export class PollingController {
           status.status !== undefined &&
           TERMINAL_STATUSES.has(status.status);
         if (isTerminal) {
-          await this.finalize(tab, status!);
+          await this.finalize(tab, status);
         } else if (tab.pollInterval !== undefined) {
           tab.isLoading = true;
           tab.pollInterval = window.setTimeout(poll, POLL_INTERVAL_MS);
         }
         this.cb.redraw();
       } catch (e) {
+        if (
+          e instanceof QueryCancelledError ||
+          tab.lifecycle.signal.aborted ||
+          tab.pollGeneration !== generation
+        ) {
+          return;
+        }
         if (e instanceof QueryNotFoundError) {
           this.dropStaleQueryUuid(tab);
           return;
@@ -118,6 +125,9 @@ export class PollingController {
       totalTraces: status.totalTraces ?? 0,
       status: status.status ?? 'N/A',
     });
+    if (tab.queryResult) {
+      tab.queryResult.totalRowCount = status.processedRows ?? 0;
+    }
     this.cb.redraw();
   }
 
@@ -135,55 +145,79 @@ export class PollingController {
       queryStore.update(tab.queryUuid, {endTime: Date.now()});
     }
 
+    const isFailed = status.status === 'FAILED';
+    const isSuccess = status.status === 'SUCCESS';
+
+    // Fetch full execution details (schema, tableName, final row count, error)
+    // BEFORE marking isLoading = false and loading DataGrid rows so the grid
+    // never renders empty schema or "Query returned no rows" prematurely.
+    if (tab.queryClient && tab.queryUuid) {
+      try {
+        const details = await tab.queryClient.getQueryExecution(
+          tab.queryUuid,
+          tab.lifecycle.signal,
+        );
+        const endMs = isoToEpochMs(details.endTime);
+        queryStore.update(tab.queryUuid, {
+          ...(endMs !== undefined ? {endTime: endMs} : {}),
+          ...(details.schema !== undefined ? {schema: details.schema} : {}),
+          ...(details.tableName !== undefined
+            ? {tableName: details.tableName}
+            : {}),
+          ...(details.processedRows !== undefined
+            ? {processedRows: details.processedRows}
+            : {}),
+          ...(details.processedTraces !== undefined
+            ? {processedTraces: details.processedTraces}
+            : {}),
+          ...(details.totalTraces !== undefined
+            ? {totalTraces: details.totalTraces}
+            : {}),
+          ...(details.status !== undefined ? {status: details.status} : {}),
+        });
+        if (details.tableName !== undefined && details.tableName !== '') {
+          tab.tableName = details.tableName;
+          tab.title = details.tableName;
+        }
+        if (
+          tab.queryResult !== undefined &&
+          details.processedRows !== undefined
+        ) {
+          tab.queryResult.totalRowCount = details.processedRows;
+        }
+        if (isFailed) {
+          const startMs = tab.execution?.startTime;
+          const finishMs = tab.execution?.endTime;
+          tab.queryResult = makeQueryResponse(tab.editorText, {
+            error: details.errorMessage || 'Query failed',
+            durationMs:
+              startMs !== undefined && finishMs !== undefined
+                ? finishMs - startMs
+                : 0,
+          });
+        }
+      } catch (e: unknown) {
+        if (e instanceof QueryCancelledError || tab.lifecycle.signal.aborted) {
+          return;
+        }
+        console.error('Failed to fetch query execution details:', e);
+        if (isFailed) {
+          tab.queryResult = makeQueryResponse(tab.editorText, {
+            error: `Failed to fetch error details: ${e instanceof Error ? e.message : String(e)}`,
+          });
+        }
+      }
+    }
+
     if (tab.isLoading) {
       this.cb.onHistoryChanged();
     }
     tab.isLoading = false;
 
-    const isFailed = status.status === 'FAILED';
-    const isSuccess = status.status === 'SUCCESS';
-
-    if (isFailed) {
-      const startMs = tab.execution?.startTime;
-      const endMs = tab.execution?.endTime;
-      tab.queryResult = makeQueryResponse(tab.editorText, {
-        error: 'Fetching error details...',
-        durationMs:
-          startMs !== undefined && endMs !== undefined ? endMs - startMs : 0,
-      });
-      this.cb.redraw();
-    }
-
-    // Fetch full execution details for timing + error message.
-    void tab.queryClient
-      ?.getQueryExecution(tab.queryUuid!, tab.lifecycle.signal)
-      .then((details: RawQueryExecution) => {
-        const endMs = isoToEpochMs(details.endTime);
-        if (tab.queryUuid) {
-          queryStore.update(tab.queryUuid, {
-            ...(endMs !== undefined ? {endTime: endMs} : {}),
-            ...(details.schema !== undefined ? {schema: details.schema} : {}),
-            ...(details.tableName !== undefined
-              ? {tableName: details.tableName}
-              : {}),
-          });
-        }
-        if (isFailed && tab.queryResult !== undefined) {
-          tab.queryResult.error = details.errorMessage || 'Query failed';
-        }
-        this.cb.redraw();
-      })
-      .catch((e: unknown) => {
-        console.error('Failed to fetch query execution details:', e);
-        if (isFailed && tab.queryResult !== undefined) {
-          tab.queryResult.error = `Failed to fetch error details: ${e instanceof Error ? e.message : String(e)}`;
-          this.cb.redraw();
-        }
-      });
-
     if (isSuccess && tab.dataSource instanceof BigtraceAsyncDataSource) {
-      tab.dataSource.refresh();
+      await tab.dataSource.refresh();
       tab.lastProcessedRows = tab.execution?.processedRows ?? 0;
     }
+    this.cb.redraw();
   }
 }

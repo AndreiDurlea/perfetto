@@ -870,8 +870,8 @@ export class QuerySettingsForm implements m.ClassComponent<QuerySettingsFormAttr
               type: 'number',
               value: String(this.bindings.getTraceLimit()),
               onInput: (value: string) => {
-                const n = parseInt(value, 10);
-                if (!isNaN(n) && n > 0) this.bindings.setTraceLimit(n);
+                const n = value.trim() === '' ? 0 : parseInt(value, 10);
+                if (!isNaN(n) && n >= 0) this.bindings.setTraceLimit(n);
               },
             }),
           }),

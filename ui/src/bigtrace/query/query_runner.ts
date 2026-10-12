@@ -55,7 +55,9 @@ export class QueryRunner {
   constructor(private readonly cb: QueryRunnerCallbacks) {
     this.poller = new PollingController({
       redraw: () => this.redraw(),
-      onHistoryChanged: cb.onHistoryChanged,
+      onHistoryChanged: () => {
+        cb.onHistoryChanged();
+      },
     });
   }
 
@@ -64,9 +66,13 @@ export class QueryRunner {
     if (!query) return;
 
     tab.activeRequest?.abort();
+    this.poller.stop(tab);
+    tab.pollGeneration++;
 
     tab.isLoading = true;
+    tab.execution = undefined;
     tab.queryResult = undefined;
+    tab.dataSource = undefined;
     tab.lastProcessedRows = 0;
     tab.clientStartTime = Date.now();
     this.cb.markDirty?.();
@@ -122,12 +128,14 @@ export class QueryRunner {
       }
     }
     const executeOptions: ExecuteOptions = {
+      engine: tab.queryEngine,
       traceFilters,
       traceMetadataColumns,
       traceOrderBy,
       traceLimit: tab.traceLimit,
       experimentFilter: toExperimentFilterSpec(tab.experimentFilter),
       tableTtlDays: tab.materialize ? tab.tableTtlDays : undefined,
+      tableName: tab.tableName.trim() || tab.title.trim() || undefined,
     };
 
     const wallStartMs = performance.now();
@@ -255,15 +263,18 @@ export class QueryRunner {
     if (details.schema !== undefined) {
       exec.schema = details.schema;
     }
-    if (details.tableName !== undefined) {
+    if (details.tableName !== undefined && details.tableName !== '') {
       exec.tableName = details.tableName;
+      tab.tableName = details.tableName;
+      tab.title = details.tableName;
     }
+    tab.queryEngine = details.queryEngine === 'duckdb' ? 'duckdb' : 'traces';
     exec.status = details.status ?? 'N/A';
     exec.processedRows = details.processedRows ?? 0;
     exec.processedTraces = details.processedTraces ?? 0;
     exec.totalTraces = details.totalTraces ?? 0;
     if (details.limit !== undefined) tab.limit = details.limit;
-    if (typeof details.traceLimit === 'number' && details.traceLimit > 0) {
+    if (typeof details.traceLimit === 'number' && details.traceLimit >= 0) {
       tab.traceLimit = details.traceLimit;
     }
     // Restore the submit-time snapshot so the settings bar reflects what this
@@ -343,6 +354,7 @@ export class QueryRunner {
         details.errorMessage ??
         'Query failed without a specific error message.';
     }
+
     this.redraw();
   }
 
@@ -376,10 +388,24 @@ export class QueryRunner {
     if (data.queryUuid === undefined || data.queryUuid === '') {
       throw new Error('Backend did not return a queryUuid for async execute');
     }
+
     tab.queryUuid = data.queryUuid;
     tab.execution = queryStore.getOrCreate(tab.queryUuid, {
       perfettoSql: query,
+      status: 'IN_PROGRESS',
     });
+    tab.dataSource = new BigtraceAsyncDataSource(
+      tab.queryUuid,
+      client,
+      () => tab.execution?.processedRows ?? 0,
+      tab.lifecycle.signal,
+      () => tab.execution?.schema,
+    );
+    tab.queryResult = makeQueryResponse(query, {
+      durationMs: performance.now() - wallStartMs,
+    });
+    this.redraw();
+    this.poller.start(tab);
 
     try {
       const details = await client.getQueryExecution(
@@ -393,22 +419,25 @@ export class QueryRunner {
         ...(details?.tableName !== undefined
           ? {tableName: details.tableName}
           : {}),
+        ...(details?.processedRows !== undefined
+          ? {processedRows: details.processedRows}
+          : {}),
+        ...(details?.processedTraces !== undefined
+          ? {processedTraces: details.processedTraces}
+          : {}),
+        ...(details?.totalTraces !== undefined
+          ? {totalTraces: details.totalTraces}
+          : {}),
       });
+      if (details?.tableName !== undefined && details.tableName !== '') {
+        tab.tableName = details.tableName;
+        tab.title = details.tableName;
+        this.cb.markDirty?.();
+      }
+      this.redraw();
     } catch (e) {
       console.error('Failed to fetch query details after executeAsync:', e);
     }
-
-    this.poller.start(tab);
-    tab.dataSource = new BigtraceAsyncDataSource(
-      tab.queryUuid,
-      client,
-      () => tab.execution?.processedRows ?? 0,
-      tab.lifecycle.signal,
-      () => tab.execution?.schema,
-    );
-    tab.queryResult = makeQueryResponse(query, {
-      durationMs: performance.now() - wallStartMs,
-    });
   }
 
   private async runSync(
@@ -430,9 +459,18 @@ export class QueryRunner {
     if (result.queryUuid === undefined || result.queryUuid === '') {
       throw new Error('Backend did not return a queryUuid for sync execute');
     }
+
     tab.queryUuid = result.queryUuid;
+    const resolvedTable =
+      result.tableName || result.executions?.[0]?.tableName || undefined;
+    if (resolvedTable) {
+      tab.tableName = resolvedTable;
+      tab.title = resolvedTable;
+      this.cb.markDirty?.();
+    }
     tab.execution = queryStore.getOrCreate(tab.queryUuid, {
       perfettoSql: query,
+      tableName: resolvedTable,
     });
     tab.queryResult = makeQueryResponse(query, {
       rows: [...result.rows],
