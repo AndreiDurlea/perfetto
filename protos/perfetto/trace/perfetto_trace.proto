@@ -6330,11 +6330,11 @@ message SystemInfo {
 
 // Statistics for the internals of the tracing service.
 //
-// Next id: 19.
+// Next id: 20.
 message TraceStats {
   // From TraceBuffer::Stats.
   //
-  // Next id: 23.
+  // Next id: 25.
   message BufferStats {
     // Size of the circular buffer in bytes.
     optional uint64 buffer_size = 12;
@@ -6452,6 +6452,18 @@ message TraceStats {
     // four-byte length field. The packet can be valid. Loss is reported on the
     // next packet of the same sequence.
     optional uint64 oversized_packets_dropped = 22;
+
+    // TraceBufferV2 only. Num. SMB v2 packets dropped at read time because
+    // they are malformed or nest more than 128 groups. Each one also counts in
+    // |abi_violations|. A nonzero value points to a bug in the code that
+    // encodes the packets. Loss is reported on the next packet of the same
+    // sequence.
+    optional uint64 malformed_packets_dropped = 23;
+
+    // The producer of the first packet counted in |malformed_packets_dropped|.
+    // It matches TracingV2ProducerStats.producer_id, which gives the app and
+    // its SDK version.
+    optional uint32 first_malformed_packet_producer_id = 24;
   }
 
   // Stats for the TraceBuffer(s) of the current trace session.
@@ -6466,6 +6478,13 @@ message TraceStats {
 
     // The buffer index (0..N, as defined in the TraceConfig).
     optional uint32 buffer = 4;
+
+    // Which protocol carried this writer's chunks to the buffer.
+    // This is a bitmask of ProtocolAbiVersion (see producer_port.proto). The
+    // value is 1 for the SMB (v1) and 2 for the tracing v2 ring buffer. Both
+    // bits are set only if a v1 and a v2 writer of the same producer used the
+    // same writer ID.
+    optional uint32 protocol_abi_versions = 5;
 
     // These two arrays have the same cardinality and match the cardinality of
     // chunk_payload_histogram_def + 1 (for the overflow bucket, see below).
@@ -6558,6 +6577,115 @@ message TraceStats {
     FINAL_FLUSH_FAILED = 2;
   }
   optional FinalFlushOutcome final_flush_outcome = 15;
+
+  // Stats for the tracing v2 ring buffer of one producer.
+  //
+  // The counters are totals since the producer connected. Like
+  // |chunks_discarded|, they also count the producer's other sessions.
+  //
+  // Next id: 26.
+  message TracingV2ProducerStats {
+    // The producer that owns the ring buffer.
+    optional uint32 producer_id = 1;
+    optional int32 pid = 2;
+    optional string producer_name = 3;
+    optional string sdk_version = 4;
+
+    // Layout of the attached ring buffer. Not set if none is attached.
+    optional uint32 chunk_size_bytes = 5;
+    optional uint32 num_chunks = 6;
+
+    // Why the service rejected the last ring buffer that the producer tried to
+    // attach. With no ring buffer attached, the producer's v2 writers drop all
+    // their data.
+    optional string attach_error = 7;
+
+    // Set when the service found an invalid state in the ring buffer and
+    // stopped reading it for good. The text has the reason, the position and
+    // the offending values. Data that the producer writes after this is lost.
+    optional string protocol_error = 8;
+
+    // The service counts the fields below while it reads the ring buffer.
+
+    // Num. chunks that the service copied out of the ring buffer.
+    optional uint64 chunks_read = 9;
+
+    // Total size of the packet fragments in |chunks_read|. It excludes the
+    // chunk headers and the fragment sizes.
+    optional uint64 payload_bytes = 10;
+
+    // Num. chunks discarded because their writer marked them as lossy. A
+    // writer marks the next chunk it gets after it dropped data, e.g. when the
+    // ring buffer was full.
+    optional uint64 data_loss_chunks = 11;
+
+    // Num. packet fragments in |data_loss_chunks|. The writer wrote them after
+    // the drop, and they are lost with the chunk.
+    optional uint64 data_loss_fragments = 12;
+
+    // Num. chunks discarded because their fragments did not fit the chunk. A
+    // nonzero value points to a writer bug or to corrupt memory.
+    optional uint64 malformed_chunks = 13;
+
+    // Num. chunks discarded because the service does not know their format.
+    optional uint64 unsupported_format_chunks = 14;
+
+    // The next three count chunks in |chunks_read| that no trace buffer
+    // stored.
+
+    // The chunk's writer ID was zero or out of range.
+    optional uint64 invalid_writer_chunks = 15;
+
+    // The chunk's target buffer is not a TraceBufferV2 that the producer can
+    // write to.
+    optional uint64 invalid_destination_chunks = 16;
+
+    // The trace buffer refused the chunk. Its BufferStats say why, in
+    // |abi_violations| or |chunks_discarded|.
+    optional uint64 trace_buffer_rejected_chunks = 17;
+
+    // Num. chunks that the service read while their writer was still filling
+    // them. The writer then moves its open fragment to another chunk.
+    optional uint64 rewrite_requests = 18;
+
+    // Num. ring buffer positions that gave no chunk to the service. They are
+    // positions that no writer claimed, chunks with no published fragment and
+    // the discarded chunks above.
+    optional uint64 positions_skipped = 19;
+
+    // Num. DrainV2RingBuffer requests from the producer.
+    optional uint64 drain_requests = 20;
+
+    // Num. times the service read the ring buffer. Besides the requests above,
+    // the service reads it on its own (e.g. on a flush) and retries a pass
+    // that stopped early. It reads nothing after a protocol error.
+    optional uint64 drain_passes = 21;
+
+    // Wall time that the service spent in |drain_passes|.
+    optional uint64 drain_time_ns = 22;
+
+    // The producer's writers count the fields below in the ring buffer header.
+    // The service reports the values as it finds them, so a buggy or hostile
+    // producer can set anything here.
+
+    // Num. packets that the writers dropped before the packets reached a
+    // chunk. The fragments in |data_loss_fragments| are lost in addition.
+    // This includes packets dropped before the service attached the ring
+    // buffer. Each writer adds its drops in batches, so the value can lag.
+    optional uint64 writer_dropped_packets = 23;
+
+    // Num. times a writer waited for a free chunk, and the total time of those
+    // waits. This is time that the app's threads were blocked. A writer checks
+    // again after about 100 ms, so a longer stall counts several times.
+    optional uint64 writer_stalls = 24;
+    optional uint64 writer_stall_time_ms = 25;
+  }
+
+  // One entry for each connected producer that has a data source in this
+  // session and that tried to attach a tracing v2 ring buffer. A producer that
+  // only uses the SMB has no entry. A cloned session has the entries from the
+  // time of the clone.
+  repeated TracingV2ProducerStats tracing_v2_producer_stats = 19;
 }
 
 // End of protos/perfetto/common/trace_stats.proto
@@ -18769,8 +18897,8 @@ message TracePacket {
     DATA_LOSS_READ_GAP = 2;
     // A chunk's fragments couldn't be tokenized (malformed / out-of-bounds),
     // or a proto-group packet couldn't be rewritten. The buffer stats
-    // abi_violations and oversized_packets_dropped tell the two rewrite
-    // failures apart.
+    // malformed_packets_dropped and oversized_packets_dropped tell the two
+    // rewrite failures apart.
     DATA_LOSS_CHUNK_CORRUPTED = 4;
     // A continuation/end fragment with no preceding begin fragment.
     DATA_LOSS_ORPHAN_CONTINUATION = 8;

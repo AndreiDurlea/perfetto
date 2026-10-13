@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "perfetto/ext/tracing/core/basic_types.h"
@@ -142,16 +143,25 @@ class SharedRingBufferReader {
   // This lets other tasks run between passes over a large ring buffer.
   DrainResult Drain(uint32_t max_positions);
 
-  bool has_protocol_error() const { return has_protocol_error_; }
+  bool has_protocol_error() const { return !protocol_error_.empty(); }
+  // Why the reader stopped, with the position and the offending values.
+  // Empty until a protocol error.
+  const std::string& protocol_error() const { return protocol_error_; }
   uint32_t read_pos() const { return read_pos_; }
 
   // For diagnostics only. The protocol never reads these counters.
-  // TODO(sashwinbalaji): Wire these counters into service statistics.
+  // The service reports them in TraceStats.TracingV2ProducerStats.
   struct Stats {
     uint64_t positions_skipped = 0;
     // Successful BeingWritten -> RewriteRequested transitions.
     uint64_t rewrite_requests = 0;
     uint64_t chunks_read = 0;
+    // Total fragment bytes of the chunks in |chunks_read|.
+    uint64_t payload_bytes = 0;
+    // Chunks discarded because they carry kFlagDataLoss, and the published
+    // fragments that were discarded with them.
+    uint64_t data_loss_chunks = 0;
+    uint64_t data_loss_fragments = 0;
     uint64_t malformed_chunks = 0;
     uint64_t unsupported_format_chunks = 0;
   };
@@ -183,9 +193,11 @@ class SharedRingBufferReader {
   // chunks as loss.
   ConsumeResult HandleCopiedChunk(CopiedChunkStatus);
 
-  // Latches the error and logs |reason| once, together with the position and
-  // the offending word. read_pos is not advanced.
+  // Stops the reader on an invalid chunk state word. read_pos is not advanced.
   ConsumeResult StopOnProtocolError(const char* reason, uint32_t state_word);
+
+  // Latches |error| in |protocol_error_| and logs it once.
+  ConsumeResult StopOnProtocolError(std::string error);
 
   SharedRingBuffer* const ring_;
   Delegate* const delegate_;
@@ -194,7 +206,7 @@ class SharedRingBufferReader {
 
   // The reader owns this value and publishes it once per Drain().
   uint32_t read_pos_ = 0;
-  bool has_protocol_error_ = false;
+  std::string protocol_error_;
 
   // Test callback, called just before the reader's chunk-state CAS.
   // - The reader has loaded the state and copied any readable fragments.

@@ -20,6 +20,7 @@
 
 #include "perfetto/base/compiler.h"
 #include "perfetto/base/logging.h"
+#include "perfetto/base/time.h"
 #include "src/tracing/service/trace_buffer_v2.h"
 
 namespace perfetto::tracing_v2 {
@@ -64,7 +65,11 @@ void ServiceRingBufferDrainer::Drain() {
   // Bound each pass to num_chunks() logical positions, including positions
   // reserved during the pass.
   const SharedRingBufferReader::Stats stats_before = reader_.GetStats();
+  const base::TimeNanos time_before = base::GetWallTimeNs();
   const auto result = reader_.Drain(ring_buffer_.num_chunks());
+  ++drain_passes_;
+  drain_time_ns_ +=
+      static_cast<uint64_t>((base::GetWallTimeNs() - time_before).count());
   const SharedRingBufferReader::Stats stats_after = reader_.GetStats();
 
   // The reader discards malformed chunks and chunks in an unknown format. It
@@ -99,6 +104,7 @@ void ServiceRingBufferDrainer::Drain() {
 void ServiceRingBufferDrainer::OnChunkRead(
     const SharedRingBufferReader::ChunkContents& chunk) {
   if (PERFETTO_UNLIKELY(!chunk.writer_id || chunk.writer_id > kMaxWriterID)) {
+    ++invalid_writer_chunks_;
     delegate_->OnRingBufferChunksDiscarded(1);
     return;
   }
@@ -106,6 +112,7 @@ void ServiceRingBufferDrainer::OnChunkRead(
   TraceBufferV2* buffer =
       delegate_->GetRingBufferDestination(chunk.target_buffer);
   if (PERFETTO_UNLIKELY(!buffer)) {
+    ++invalid_destination_chunks_;
     delegate_->OnRingBufferChunksDiscarded(1);
     RecordWriterLoss(chunk.writer_id);
     return;
@@ -123,10 +130,12 @@ void ServiceRingBufferDrainer::OnChunkRead(
   // the reader's scratch, then into a TBv2 chunk. The reader could pass the
   // decoded sizes and one payload range, so that TBv2 copies once. Measure
   // the drain cost in a profile first.
-  buffer->CopyChunkV2Untrusted(
+  const bool stored = buffer->CopyChunkV2Untrusted(
       sequence, chunk.fragments, chunk.num_fragments,
       chunk.payload_flags & kFlagContinuesFromPrevChunk,
       chunk.payload_flags & kFlagContinuesOnNextChunk);
+  if (PERFETTO_UNLIKELY(!stored))
+    ++trace_buffer_rejected_chunks_;
 }
 
 void ServiceRingBufferDrainer::OnDataLoss(WriterID writer_id) {
@@ -149,6 +158,49 @@ void ServiceRingBufferDrainer::RecordWriterLoss(WriterID writer_id) {
       [this, writer_id](TraceBufferV2& buffer) {
         buffer.RecordChunkV2DataLoss(producer_id_, writer_id);
       });
+}
+
+void ServiceRingBufferDrainer::FillStats(
+    TraceStats::TracingV2ProducerStats* stats) const {
+  PERFETTO_DCHECK_THREAD(thread_checker_);
+  using Stats = TraceStats::TracingV2ProducerStats;
+
+  stats->set_chunk_size_bytes(ring_buffer_.chunk_size());
+  stats->set_num_chunks(ring_buffer_.num_chunks());
+  if (reader_.has_protocol_error())
+    stats->set_protocol_error(reader_.protocol_error());
+
+  // A counter that is still zero stays unset, as in the trace buffer stats.
+  auto set_counter = [stats](void (Stats::*setter)(uint64_t), uint64_t value) {
+    if (value != 0)
+      (stats->*setter)(value);
+  };
+
+  const SharedRingBufferReader::Stats reader = reader_.GetStats();
+  set_counter(&Stats::set_chunks_read, reader.chunks_read);
+  set_counter(&Stats::set_payload_bytes, reader.payload_bytes);
+  set_counter(&Stats::set_data_loss_chunks, reader.data_loss_chunks);
+  set_counter(&Stats::set_data_loss_fragments, reader.data_loss_fragments);
+  set_counter(&Stats::set_malformed_chunks, reader.malformed_chunks);
+  set_counter(&Stats::set_unsupported_format_chunks,
+              reader.unsupported_format_chunks);
+  set_counter(&Stats::set_rewrite_requests, reader.rewrite_requests);
+  set_counter(&Stats::set_positions_skipped, reader.positions_skipped);
+
+  set_counter(&Stats::set_invalid_writer_chunks, invalid_writer_chunks_);
+  set_counter(&Stats::set_invalid_destination_chunks,
+              invalid_destination_chunks_);
+  set_counter(&Stats::set_trace_buffer_rejected_chunks,
+              trace_buffer_rejected_chunks_);
+  set_counter(&Stats::set_drain_passes, drain_passes_);
+  set_counter(&Stats::set_drain_time_ns, drain_time_ns_);
+
+  // The producer controls these values, so they are reported as they are.
+  const SharedRingBuffer::WriterStats writers =
+      ring_buffer_.LoadWriterStatsRelaxed();
+  set_counter(&Stats::set_writer_dropped_packets, writers.dropped_packets);
+  set_counter(&Stats::set_writer_stalls, writers.stalls);
+  set_counter(&Stats::set_writer_stall_time_ms, writers.stall_time_ms);
 }
 
 }  // namespace perfetto::tracing_v2

@@ -34,6 +34,7 @@
 #include "perfetto/ext/tracing/core/client_identity.h"
 #include "perfetto/ext/tracing/core/observable_events.h"
 #include "perfetto/ext/tracing/core/shared_memory_abi.h"
+#include "perfetto/ext/tracing/core/trace_stats.h"
 #include "perfetto/ext/tracing/core/tracing_service.h"
 #include "perfetto/tracing/core/forward_decls.h"
 #include "src/tracing/service/service_ring_buffer_drainer.h"
@@ -141,6 +142,10 @@ class ProducerEndpointImpl
     return v2_ring_buffer_drainer_ ? v2_ring_buffer_drainer_->size_bytes() : 0;
   }
 
+  // Returns the stats of this producer's ring buffer for TraceStats.
+  // Returns nullopt if the producer never tried to attach one.
+  std::optional<TraceStats::TracingV2ProducerStats> GetTracingV2Stats() const;
+
   bool IsShmemEmulated() { return shmem_abi_.use_shmem_emulation(); }
 
   bool IsAndroidProcessFrozen();
@@ -214,6 +219,14 @@ class ProducerEndpointImpl
   // DisconnectProducer() runs the final drain through |v2_ring_buffer_drainer_|
   // before |allowed_target_buffers_| is destroyed.
   std::unique_ptr<tracing_v2::ServiceRingBufferDrainer> v2_ring_buffer_drainer_;
+
+  // Why AttachV2RingBuffer() rejected the producer's last attempt.
+  // Empty if that attempt succeeded, or if there was none.
+  std::string v2_attach_error_;
+
+  // DrainV2RingBuffer() calls that reached |v2_ring_buffer_drainer_|.
+  uint64_t v2_drain_requests_ = 0;
+
   PERFETTO_THREAD_CHECKER(thread_checker_)
   base::WeakRunner weak_runner_;
 };

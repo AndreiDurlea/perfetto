@@ -178,7 +178,7 @@ class PERFETTO_EXPORT_COMPONENT ProducerEndpoint {
   // - Rejected: the connection and any existing attachment stay unchanged.
   //   The service keeps no reference to |memory|.
   //   If no ring buffer is attached, the producer can retry with a valid
-  //   mapping.
+  //   mapping. A null |memory| is rejected.
   // - |callback| runs on the endpoint sequence, possibly inline.
   // - |memory| refers to the caller's shared_ptr, and |callback| may reset it.
   //   An implementation that needs the mapping after running |callback| must

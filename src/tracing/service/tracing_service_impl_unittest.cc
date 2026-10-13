@@ -431,13 +431,30 @@ TEST_F(TracingServiceImplTest, RejectedRingBufferCanBeAttachedAgain) {
     EXPECT_TRUE(accepted.has_value());
     return accepted.value_or(false);
   };
+  // The stats that TraceStats reports for this producer.
+  auto* impl = static_cast<ProducerEndpointImpl*>(endpoint.get());
+  EXPECT_FALSE(impl->GetTracingV2Stats().has_value());
 
   // 4096 bytes minus the header is not a whole number of 256-byte chunks.
   EXPECT_FALSE(attach(4096));
+  auto stats = impl->GetTracingV2Stats();
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_FALSE(stats->attach_error().empty());
+  EXPECT_FALSE(stats->has_num_chunks());
+
   // The rejection kept nothing, so a valid layout is accepted.
   EXPECT_TRUE(attach(sizeof(tracing_v2::RingBufferHeader) + 4 * 256));
+  stats = impl->GetTracingV2Stats();
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_FALSE(stats->has_attach_error());
+  EXPECT_EQ(stats->num_chunks(), 4u);
+
   // One ring buffer per producer.
   EXPECT_FALSE(attach(sizeof(tracing_v2::RingBufferHeader) + 4 * 256));
+  stats = impl->GetTracingV2Stats();
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_EQ(stats->attach_error(), "a ring buffer is already attached");
+  EXPECT_EQ(stats->num_chunks(), 4u);
   task_runner.RunUntilIdle();
 }
 
@@ -585,8 +602,97 @@ TEST_F(TracingServiceImplTest, InProcessWriterUsesV2) {
       });
   ASSERT_TRUE(consumer->Flush().WaitForReply());
   EXPECT_THAT(TestPayloads(consumer->ReadBuffers()), ElementsAre(payload));
+
+  // TraceStats has the producer's ring buffer, and says that the writer's
+  // chunks came through it.
+  consumer->GetTraceStats();
+  const TraceStats stats = consumer->WaitForTraceStats(/*success=*/true);
+  ASSERT_EQ(stats.tracing_v2_producer_stats().size(), 1u);
+  const auto& producer_stats = stats.tracing_v2_producer_stats()[0];
+  EXPECT_EQ(producer_stats.pid(), 1025);
+  EXPECT_EQ(producer_stats.producer_name(), "ring_buffer");
+  EXPECT_EQ(producer_stats.chunk_size_bytes() * producer_stats.num_chunks() +
+                sizeof(tracing_v2::RingBufferHeader),
+            impl->ring_buffer_size_bytes());
+  EXPECT_GT(producer_stats.chunks_read(), 0u);
+  EXPECT_GT(producer_stats.payload_bytes(), payload.size());
+  EXPECT_GT(producer_stats.drain_requests(), 0u);
+  EXPECT_GE(producer_stats.drain_passes(), producer_stats.drain_requests());
+  EXPECT_FALSE(producer_stats.has_protocol_error());
+  ASSERT_EQ(stats.writer_stats().size(), 1u);
+  EXPECT_EQ(stats.writer_stats()[0].protocol_abi_versions(), kProtocolAbiV2);
+
   writer.reset();
   EXPECT_CALL(producer, StopDataSource(instance));
+  consumer->DisableTracing();
+  consumer->WaitForTracingDisabled();
+}
+
+// TraceStats lists a producer's ring buffer only in the sessions that have one
+// of its data sources. A cloned session reports the stats from the time of the
+// clone.
+TEST_F(TracingServiceImplTest, TracingV2ProducerStatsFollowSession) {
+  NiceMock<MockProducer> producer(&task_runner);
+  NiceMock<MockProducer> other_producer(&task_runner);
+  // Each producer registers a data source with its name and attaches a ring
+  // buffer of four chunks.
+  auto connect = [&](MockProducer* mock, const std::string& name) {
+    auto endpoint = svc->ConnectProducer(
+        mock, ClientIdentity(42, 1025), name,
+        /*shared_memory_size_hint_bytes=*/0, /*in_process=*/true,
+        TracingService::ProducerSMBScrapingMode::kDefault,
+        /*shared_memory_page_size_hint_bytes=*/0, /*shm=*/nullptr,
+        /*sdk_version=*/"1.2.3", /*machine_name=*/{},
+        kProtocolAbiV1 | kProtocolAbiV2);
+    DataSourceDescriptor descriptor;
+    descriptor.set_name(name);
+    endpoint->RegisterDataSource(descriptor);
+    endpoint->AttachV2RingBuffer(
+        std::make_shared<InProcessSharedMemory>(
+            sizeof(tracing_v2::RingBufferHeader) + 4 * 256),
+        /*chunk_size_bytes=*/256, [](bool accepted) { EXPECT_TRUE(accepted); });
+    return endpoint;
+  };
+  auto endpoint = connect(&producer, "in_session");
+  auto other_endpoint = connect(&other_producer, "not_in_session");
+
+  auto consumer = CreateMockConsumer();
+  consumer->Connect(svc.get());
+  consumer->EnableTracing(RingBufferConfig("in_session"));
+  task_runner.RunUntilIdle();
+
+  consumer->GetTraceStats();
+  TraceStats stats = consumer->WaitForTraceStats(/*success=*/true);
+  ASSERT_EQ(stats.tracing_v2_producer_stats().size(), 1u);
+  EXPECT_EQ(stats.tracing_v2_producer_stats()[0].producer_name(), "in_session");
+  EXPECT_EQ(stats.tracing_v2_producer_stats()[0].sdk_version(), "1.2.3");
+  EXPECT_EQ(stats.tracing_v2_producer_stats()[0].num_chunks(), 4u);
+
+  // The clone flushes the session's producers first.
+  auto clone_consumer = CreateMockConsumer();
+  clone_consumer->Connect(svc.get());
+  EXPECT_CALL(producer, Flush(_, _, _, _))
+      .WillOnce([&](FlushRequestID id, const DataSourceInstanceID*, size_t,
+                    FlushFlags) { endpoint->NotifyFlushComplete(id); });
+  auto clone_done = task_runner.CreateCheckpoint("clone_done");
+  EXPECT_CALL(*clone_consumer, OnSessionCloned(_))
+      .WillOnce([&](const Consumer::OnSessionClonedArgs& args) {
+        EXPECT_TRUE(args.success);
+        clone_done();
+      });
+  clone_consumer->CloneSession(GetLastTracingSessionId(consumer.get()));
+  task_runner.RunUntilCheckpoint("clone_done");
+
+  // The cloned session has no data source instances. It still has the entry.
+  clone_consumer->GetTraceStats();
+  stats = clone_consumer->WaitForTraceStats(/*success=*/true);
+  ASSERT_EQ(stats.tracing_v2_producer_stats().size(), 1u);
+  EXPECT_EQ(stats.tracing_v2_producer_stats()[0].producer_name(), "in_session");
+  // The service drained on the attach and on the clone's flush.
+  // The producer sent no drain request.
+  EXPECT_GE(stats.tracing_v2_producer_stats()[0].drain_passes(), 2u);
+  EXPECT_EQ(stats.tracing_v2_producer_stats()[0].drain_requests(), 0u);
+
   consumer->DisableTracing();
   consumer->WaitForTracingDisabled();
 }
@@ -5956,6 +6062,8 @@ TEST_F(TracingServiceImplTest, TraceWriterStats) {
                 packet.trace_stats().chunk_payload_histogram_def()[i]),
             wri.chunk_payload_histogram_counts()[i]);
       }
+      // Both writers use the SMB.
+      EXPECT_EQ(wri.protocol_abi_versions(), kProtocolAbiV1);
 
       switch (wri.sequence_id()) {
         case 1:  // Ignore service-generated packets.

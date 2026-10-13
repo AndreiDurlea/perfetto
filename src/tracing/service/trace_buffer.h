@@ -26,6 +26,7 @@
 #include "perfetto/ext/tracing/core/basic_types.h"
 #include "perfetto/ext/tracing/core/client_identity.h"
 #include "perfetto/ext/tracing/core/trace_stats.h"
+#include "perfetto/ext/tracing/core/tracing_service.h"
 #include "src/tracing/service/histogram.h"
 
 namespace perfetto {
@@ -134,8 +135,14 @@ class TraceBuffer_WriterStats {
  public:
   using WriterBuckets =
       Histogram<8, 32, 128, 512, 1024, 2048, 4096, 8192, 12288, 16384>;
+  struct Entry {
+    WriterBuckets chunk_payload_histogram;
+    // Bitmask of the ProtocolAbiVersion values that carried this writer's
+    // chunks to the buffer.
+    uint32_t protocol_abi_versions = 0;
+  };
   using WriterStatsMap = base::FlatHashMap<ProducerAndWriterID,
-                                           WriterBuckets,
+                                           Entry,
                                            std::hash<ProducerAndWriterID>,
                                            base::QuadraticProbe,
                                            /*AppendOnly=*/true>;
@@ -153,8 +160,13 @@ class TraceBuffer_WriterStats {
     return *this;
   }
 
-  void Insert(ProducerAndWriterID key, HistValue val) {
-    map_.Insert(key, {}).first->Add(val);
+  // Adds one chunk of payload size |val| that arrived through |protocol|.
+  void Insert(ProducerAndWriterID key,
+              HistValue val,
+              ProtocolAbiVersion protocol) {
+    Entry& entry = *map_.Insert(key, {}).first;
+    entry.chunk_payload_histogram.Add(val);
+    entry.protocol_abi_versions |= protocol;
   }
 
   WriterStatsMap::Iterator GetIterator() const { return map_.GetIterator(); }

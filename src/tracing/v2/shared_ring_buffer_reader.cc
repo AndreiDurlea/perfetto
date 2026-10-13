@@ -18,12 +18,19 @@
 
 #include <stdint.h>
 
+#include <string>
+#include <utility>
+
 #include "perfetto/base/logging.h"
+#include "perfetto/ext/base/string_utils.h"
 #include "src/tracing/v2/shared_ring_buffer.h"
 #include "src/tracing/v2/shared_ring_buffer_abi.h"
 
 namespace perfetto::tracing_v2 {
 namespace {
+
+// Longer protocol error texts are truncated.
+constexpr size_t kMaxProtocolErrorSize = 256;
 
 // Bound attempts at one position. For M = kMaxFragmentsPerChunk:
 // - Each fragment can defeat the reader's CAS twice:
@@ -40,7 +47,7 @@ namespace {
 // without increasing the fragment count.
 constexpr uint32_t kMaxAttemptsPerPosition = 2 * kMaxFragmentsPerChunk + 2;
 
-// For the protocol-error log only.
+// For the protocol error text only.
 const char* ChunkStateName(ChunkState state) {
   switch (state) {
     case ChunkState::kFree:
@@ -131,7 +138,7 @@ SharedRingBufferReader::DrainResult SharedRingBufferReader::Drain(
 // it, report a protocol error.
 SharedRingBufferReader::ConsumeResult
 SharedRingBufferReader::ConsumeNextPosition() {
-  if (PERFETTO_UNLIKELY(has_protocol_error_))
+  if (PERFETTO_UNLIKELY(has_protocol_error()))
     return ConsumeResult::kProtocolError;
 
   // A relaxed load is enough here. An older write_pos only shortens this
@@ -143,13 +150,12 @@ SharedRingBufferReader::ConsumeNextPosition() {
   if (PERFETTO_UNLIKELY(outstanding > num_chunks_)) {
     // A legal writer cannot reserve more than num_chunks outstanding
     // positions.
-    has_protocol_error_ = true;
-    PERFETTO_ELOG(
-        "tracing v2: stopping ring buffer reader: write_pos %u is %u "
-        "positions ahead of read_pos %u, which is more than the %u chunks "
-        "in the ring buffer",
-        write_pos, outstanding, read_pos_, num_chunks_);
-    return ConsumeResult::kProtocolError;
+    return StopOnProtocolError(
+        base::StackString<kMaxProtocolErrorSize>(
+            "write_pos %u is %u positions ahead of read_pos %u, which is more "
+            "than the %u chunks in the ring buffer",
+            write_pos, outstanding, read_pos_, num_chunks_)
+            .ToStdString());
   }
 
   // read_pos_ is the next logical position.
@@ -217,7 +223,7 @@ SharedRingBufferReader::ConsumeNextPosition() {
       // kFlagDataLoss to the relocated fragment instead.
       if (status == CopiedChunkStatus::kNoFragments &&
           (copied_chunk_.payload_flags & kFlagDataLoss)) {
-        delegate_->OnDataLoss(copied_chunk_.writer_id);
+        return HandleCopiedChunk(CopiedChunkStatus::kDataLoss);
       }
       return HandleCopiedChunk(status);
     }
@@ -280,8 +286,11 @@ SharedRingBufferReader::CopyPublishedFragments(ChunkIndex chunk_idx,
   // - Do not read an unpublished fragment. The writer may relocate it.
   // The caller must win the state transition before reporting the gap or
   // advancing read_pos. See Delegate::OnDataLoss() for packet recovery.
-  if (state_word & kFlagDataLoss)
+  if (state_word & kFlagDataLoss) {
+    // Only for the stats. HandleCopiedChunk() counts them as lost.
+    copied_chunk_.num_fragments = num_fragments;
     return CopiedChunkStatus::kDataLoss;
+  }
 
   if (ChunkFormatOf(state_word) != ChunkFormat::kTargetBuffer)
     return CopiedChunkStatus::kUnsupportedFormat;
@@ -335,6 +344,7 @@ SharedRingBufferReader::ConsumeResult SharedRingBufferReader::HandleCopiedChunk(
   switch (status) {
     case CopiedChunkStatus::kReady:
       ++stats_.chunks_read;
+      stats_.payload_bytes += copied_payload_.size();
       delegate_->OnChunkRead(copied_chunk_);
       return ConsumeResult::kChunkRead;
     case CopiedChunkStatus::kMalformed:
@@ -346,6 +356,8 @@ SharedRingBufferReader::ConsumeResult SharedRingBufferReader::HandleCopiedChunk(
       delegate_->OnDataLoss(copied_chunk_.writer_id);
       break;
     case CopiedChunkStatus::kDataLoss:
+      ++stats_.data_loss_chunks;
+      stats_.data_loss_fragments += copied_chunk_.num_fragments;
       delegate_->OnDataLoss(copied_chunk_.writer_id);
       break;
     case CopiedChunkStatus::kNoFragments:
@@ -359,12 +371,19 @@ SharedRingBufferReader::ConsumeResult SharedRingBufferReader::HandleCopiedChunk(
 SharedRingBufferReader::ConsumeResult
 SharedRingBufferReader::StopOnProtocolError(const char* reason,
                                             uint32_t state_word) {
+  return StopOnProtocolError(
+      base::StackString<kMaxProtocolErrorSize>(
+          "%s at position %u (chunk state word 0x%08x, %s)", reason, read_pos_,
+          state_word, ChunkStateName(ChunkStateOf(state_word)))
+          .ToStdString());
+}
+
+SharedRingBufferReader::ConsumeResult
+SharedRingBufferReader::StopOnProtocolError(std::string error) {
   // Stop rather than trusting a malformed word from a producer. Log once.
-  has_protocol_error_ = true;
-  PERFETTO_ELOG(
-      "tracing v2: stopping ring buffer reader at position %u: %s "
-      "(chunk state word 0x%08x, %s)",
-      read_pos_, reason, state_word, ChunkStateName(ChunkStateOf(state_word)));
+  protocol_error_ = std::move(error);
+  PERFETTO_ELOG("tracing v2: stopping ring buffer reader: %s",
+                protocol_error_.c_str());
   return ConsumeResult::kProtocolError;
 }
 

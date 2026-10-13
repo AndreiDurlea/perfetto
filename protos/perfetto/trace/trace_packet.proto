@@ -435,8 +435,8 @@ message TracePacket {
     DATA_LOSS_READ_GAP = 2;
     // A chunk's fragments couldn't be tokenized (malformed / out-of-bounds),
     // or a proto-group packet couldn't be rewritten. The buffer stats
-    // abi_violations and oversized_packets_dropped tell the two rewrite
-    // failures apart.
+    // malformed_packets_dropped and oversized_packets_dropped tell the two
+    // rewrite failures apart.
     DATA_LOSS_CHUNK_CORRUPTED = 4;
     // A continuation/end fragment with no preceding begin fragment.
     DATA_LOSS_ORPHAN_CONTINUATION = 8;

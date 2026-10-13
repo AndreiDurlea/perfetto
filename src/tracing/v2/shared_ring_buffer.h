@@ -255,6 +255,27 @@ class SharedRingBuffer {
   // can lag the reader's local value. The lag only under-reports free capacity.
   void PublishReadPos(uint32_t read_pos);
 
+  // Writer stats.
+  //
+  // Writers count in the header what the service cannot see from the chunks.
+  // The service reports the values in TraceStats. The protocol never reads
+  // them.
+
+  // Adds |count| packets that a writer dropped because it got no chunk.
+  void AddDroppedPackets(uint64_t count);
+
+  // Counts one wait for space that blocked a writer for |time_ms|.
+  void AddStall(uint64_t time_ms);
+
+  struct WriterStats {
+    uint64_t dropped_packets = 0;
+    uint64_t stalls = 0;
+    uint64_t stall_time_ms = 0;
+  };
+
+  // Loads each counter separately, so the values can be from different times.
+  WriterStats LoadWriterStatsRelaxed() const;
+
  private:
   friend class test::SharedRingBufferInternalsForTest;
 

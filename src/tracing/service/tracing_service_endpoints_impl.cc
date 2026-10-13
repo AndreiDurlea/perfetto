@@ -826,13 +826,18 @@ void ProducerEndpointImpl::AttachV2RingBuffer(
     status = base::ErrStatus("the connection has no tracing v2");
   } else if (v2_ring_buffer_drainer_) {
     status = base::ErrStatus("a ring buffer is already attached");
-  } else if (!memory || memory->size() > TracingService::kMaxShmSize) {
-    status = base::ErrStatus("no mapping, or the mapping is too large");
+  } else if (!memory) {
+    status = base::ErrStatus("the service could not map the ring buffer");
+  } else if (memory->size() > TracingService::kMaxShmSize) {
+    status = base::ErrStatus("the mapping is too large");
   } else {
     status = tracing_v2::NumChunksForRingBufferLayout(
                  memory->start(), memory->size(), chunk_size_bytes)
                  .status();
   }
+  // TraceStats reports the reason, so that a trace shows why the producer's v2
+  // data is missing.
+  v2_attach_error_ = status.message();
   if (!status.ok()) {
     PERFETTO_DLOG("Producer %" PRIu16 " \"%s\": ring buffer rejected: %s", id_,
                   name_.c_str(), status.c_message());
@@ -845,14 +850,37 @@ void ProducerEndpointImpl::AttachV2RingBuffer(
           memory, chunk_size_bytes, id_, client_identity_, this,
           weak_runner_.task_runner());
   service_->UpdateMemoryGuardrail();
-  DrainV2RingBuffer();
+  // Read what the producer published before the attach.
+  v2_ring_buffer_drainer_->Drain();
   callback(true);
 }
 
 void ProducerEndpointImpl::DrainV2RingBuffer() {
   PERFETTO_DCHECK_THREAD(thread_checker_);
-  if (v2_ring_buffer_drainer_)
-    v2_ring_buffer_drainer_->Drain();
+  if (!v2_ring_buffer_drainer_)
+    return;
+  ++v2_drain_requests_;
+  v2_ring_buffer_drainer_->Drain();
+}
+
+std::optional<TraceStats::TracingV2ProducerStats>
+ProducerEndpointImpl::GetTracingV2Stats() const {
+  PERFETTO_DCHECK_THREAD(thread_checker_);
+  if (!v2_ring_buffer_drainer_ && v2_attach_error_.empty())
+    return std::nullopt;
+
+  TraceStats::TracingV2ProducerStats stats;
+  stats.set_producer_id(id_);
+  stats.set_pid(static_cast<int32_t>(pid()));
+  stats.set_producer_name(name_);
+  stats.set_sdk_version(sdk_version_);
+  if (!v2_attach_error_.empty())
+    stats.set_attach_error(v2_attach_error_);
+  if (v2_ring_buffer_drainer_) {
+    stats.set_drain_requests(v2_drain_requests_);
+    v2_ring_buffer_drainer_->FillStats(&stats);
+  }
+  return stats;
 }
 
 TraceBufferV2* ProducerEndpointImpl::GetRingBufferDestination(BufferID id) {

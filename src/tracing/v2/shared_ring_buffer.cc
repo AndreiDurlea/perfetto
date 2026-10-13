@@ -414,4 +414,30 @@ void SharedRingBuffer::PublishReadPosFromSnapshot(uint64_t rw_positions,
   base::FutexWake(ReadPosFutexAddress(&ring_header->rw_positions), INT_MAX);
 }
 
+// --- Writer stats. ---
+//
+// All accesses are relaxed. Each counter is independent of the others and of
+// the ring buffer state, and nothing but TraceStats reads them.
+
+void SharedRingBuffer::AddDroppedPackets(uint64_t count) {
+  header()->dropped_packets.fetch_add(count, std::memory_order_relaxed);
+}
+
+void SharedRingBuffer::AddStall(uint64_t time_ms) {
+  RingBufferHeader* ring_header = header();
+  ring_header->stalls.fetch_add(1, std::memory_order_relaxed);
+  ring_header->stall_time_ms.fetch_add(time_ms, std::memory_order_relaxed);
+}
+
+SharedRingBuffer::WriterStats SharedRingBuffer::LoadWriterStatsRelaxed() const {
+  const RingBufferHeader* ring_header = header();
+  WriterStats stats{};
+  stats.dropped_packets =
+      ring_header->dropped_packets.load(std::memory_order_relaxed);
+  stats.stalls = ring_header->stalls.load(std::memory_order_relaxed);
+  stats.stall_time_ms =
+      ring_header->stall_time_ms.load(std::memory_order_relaxed);
+  return stats;
+}
+
 }  // namespace perfetto::tracing_v2

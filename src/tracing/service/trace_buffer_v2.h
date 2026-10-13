@@ -653,10 +653,12 @@ class TraceBufferV2 : public TraceBuffer {
   // without nested messages keeps its slices into the buffer, as an SMB
   // packet does. Otherwise the packet gets one owned slice. Returns false,
   // leaving the packet unchanged, for:
-  // - malformed input, counted in abi_violations.
+  // - malformed input, counted in abi_violations and
+  //   malformed_packets_dropped. The stats also keep the producer of the
+  //   first one, from |seq|.
   // - a packet that length-delimited protobuf cannot encode, counted in
   //   oversized_packets_dropped.
-  bool RewriteProtoGroupPacket(TracePacket*);
+  bool RewriteProtoGroupPacket(const SequenceState& seq, TracePacket*);
 
   void DcheckIsAlignedAndWithinBounds(size_t off) const {
     PERFETTO_DCHECK((off & (alignof(TBChunk) - 1)) == 0);

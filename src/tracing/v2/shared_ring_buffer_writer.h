@@ -226,7 +226,9 @@ class SharedRingBufferWriter {
   uint32_t max_fragment_size() const { return max_fragment_size_; }
 
   // For diagnostics only. The protocol never reads these counters.
-  // TODO(sashwinbalaji): Wire these counters into service statistics.
+  // They stay in the producer. TraceStats.TracingV2ProducerStats has what the
+  // service sees instead. Failed claims show up in positions_skipped, and
+  // relocations in rewrite_requests.
   struct Stats {
     uint64_t failed_claims = 0;
     uint64_t fragments_dropped = 0;

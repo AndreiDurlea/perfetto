@@ -63,6 +63,11 @@ constexpr uint32_t kMaxWaitMs = 100;
 // in SharedMemoryArbiterImpl::GetNewChunk().
 constexpr uint32_t kStallTimeoutMs = 30000;
 
+// A writer adds its dropped packets to the ring buffer header at the latest
+// after this many drops. All writers share the header's cache line, so a
+// writer that drops every packet must not write to it for each one.
+constexpr uint32_t kMaxUnreportedDroppedPackets = 128;
+
 // Drop mode writes go here, so the data source can finish the packet. Nobody
 // reads it.
 // - All writers of the process share it, as v1 writers share
@@ -142,6 +147,7 @@ void TraceWriterV2Impl::Flush(std::function<void()> callback) {
   // reservations.
   ring_buffer_writer_.FinishCurrentChunk();
   stream_writer_.Reset({nullptr, nullptr});
+  ReportDroppedPackets();
   ring_buffer_arbiter_->Flush(std::move(callback));
 }
 
@@ -194,7 +200,10 @@ protozero::ContiguousMemoryRange TraceWriterV2Impl::BeginPacketFragment(
         kMinFragmentPayloadSize, continues_from_prev);
     if (range.result == SharedRingBufferWriter::BeginFragmentResult::kSuccess) {
       fragment_begin_ = range.begin;
-      in_drop_mode_ = false;
+      if (PERFETTO_UNLIKELY(in_drop_mode_)) {
+        in_drop_mode_ = false;
+        ReportDroppedPackets();
+      }
       return {range.begin, range.end};
     }
     // Every valid chunk size holds kMinFragmentPayloadSize.
@@ -282,8 +291,9 @@ bool TraceWriterV2Impl::TryStallForSpace(
   // Without an attached reader, nothing frees space. So drop, also under
   // kStall. A wait would only end at the deadline, where kStall crashes.
   uint32_t time_left_ms = 0;
+  base::TimeMillis now{};
   if (can_stall && ring_buffer_arbiter_->IsReaderAttached()) {
-    const base::TimeMillis now = get_time_ms_();
+    now = get_time_ms_();
     if (!stall_deadline->has_value())
       *stall_deadline = now + base::TimeMillis(kStallTimeoutMs);
     const base::TimeMillis deadline = **stall_deadline;
@@ -325,17 +335,33 @@ bool TraceWriterV2Impl::TryStallForSpace(
   // measured before the request above. So the wait can end slightly after the
   // deadline. The next check then drops or aborts.
   ring_buffer_writer_.WaitForReadPosChange(std::min(kMaxWaitMs, time_left_ms));
+
+  // |now| is from before the drain request, so this counts the whole time
+  // that the thread was blocked.
+  ring_buffer_arbiter_->ring_buffer()->AddStall(
+      static_cast<uint64_t>((get_time_ms_() - now).count()));
   return true;
 }
 
 void TraceWriterV2Impl::EnterDropMode() {
   fragment_begin_ = nullptr;
+  // Every dropped packet gets here once.
+  if (++unreported_dropped_packets_ >= kMaxUnreportedDroppedPackets)
+    ReportDroppedPackets();
   // Consecutive dropped packets count as one drop.
   if (in_drop_mode_)
     return;
   in_drop_mode_ = true;
   ++drop_count_;
   ring_buffer_writer_.RecordDataLoss();
+}
+
+void TraceWriterV2Impl::ReportDroppedPackets() {
+  if (unreported_dropped_packets_ == 0)
+    return;
+  ring_buffer_arbiter_->ring_buffer()->AddDroppedPackets(
+      unreported_dropped_packets_);
+  unreported_dropped_packets_ = 0;
 }
 
 protozero::ContiguousMemoryRange TraceWriterV2Impl::GetDropBuffer() {

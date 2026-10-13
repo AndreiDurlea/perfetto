@@ -1090,5 +1090,30 @@ TEST(SharedRingBufferTest, PublishWithoutWaitersLeavesHintClean) {
   EXPECT_EQ(Internals::GetReadPos(ring.get()), 3u);
 }
 
+// The writer stats are in the header, so a second view of the same memory
+// reads them. The service reads the producer's counters this way.
+TEST(SharedRingBufferTest, WriterStatsAreShared) {
+  const size_t size = RingSizeFor(2, kChunkSize);
+  base::PagedMemory memory = base::PagedMemory::Allocate(size);
+  uint8_t* start = static_cast<uint8_t*>(memory.Get());
+  SharedRingBuffer producer_view(start, size, kChunkSize);
+  SharedRingBuffer service_view(start, size, kChunkSize);
+
+  producer_view.AddDroppedPackets(3);
+  producer_view.AddDroppedPackets(4);
+  producer_view.AddStall(20);
+  producer_view.AddStall(100);
+
+  const SharedRingBuffer::WriterStats stats =
+      service_view.LoadWriterStatsRelaxed();
+  EXPECT_EQ(stats.dropped_packets, 7u);
+  EXPECT_EQ(stats.stalls, 2u);
+  EXPECT_EQ(stats.stall_time_ms, 120u);
+
+  // The counters do not change the positions.
+  EXPECT_EQ(Internals::GetReadPos(&service_view), 0u);
+  EXPECT_EQ(service_view.LoadWritePosRelaxed(), 0u);
+}
+
 }  // namespace
 }  // namespace perfetto::tracing_v2

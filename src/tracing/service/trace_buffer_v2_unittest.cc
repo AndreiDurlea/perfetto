@@ -4054,6 +4054,19 @@ TEST_F(TraceBufferV2Test, V2Rewrite_MalformedInput) {
   // A malformed packet is a producer bug, not a size limit.
   EXPECT_EQ(trace_buffer()->stats().abi_violations(), 1u);
   EXPECT_EQ(trace_buffer()->stats().oversized_packets_dropped(), 0u);
+  // The stats also say which producer sent it.
+  EXPECT_EQ(trace_buffer()->stats().malformed_packets_dropped(), 1u);
+  EXPECT_EQ(trace_buffer()->stats().first_malformed_packet_producer_id(),
+            seq.producer_id_trusted);
+
+  // A malformed packet from another producer counts. The first producer stays.
+  auto other_seq = MakeV2SeqProps(2, 1);
+  trace_buffer()->CopyChunkV2Untrusted(other_seq, &fv, 1, false, false);
+  trace_buffer()->BeginRead();
+  EXPECT_THAT(ReadPacket(), IsEmpty());
+  EXPECT_EQ(trace_buffer()->stats().malformed_packets_dropped(), 2u);
+  EXPECT_EQ(trace_buffer()->stats().first_malformed_packet_producer_id(),
+            seq.producer_id_trusted);
 }
 
 // 13. Interleaved v1 and v2: both read back correctly.
@@ -4550,6 +4563,10 @@ TEST_F(TraceBufferV2Test, V2Mixed_StatsKeysPreserveWriterBits) {
     ++count;
     EXPECT_TRUE(it.key() == MkProducerAndWriterID(1, 0x8001) ||
                 it.key() == MkProducerAndWriterID(1, 1));
+    // Each entry has the protocol that carried the writer's chunk.
+    EXPECT_EQ(it.value().protocol_abi_versions,
+              it.key() == MkProducerAndWriterID(1, 1) ? kProtocolAbiV2
+                                                      : kProtocolAbiV1);
   }
   EXPECT_EQ(count, 2u);
   trace_buffer()->BeginRead();

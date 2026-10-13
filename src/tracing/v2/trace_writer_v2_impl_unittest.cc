@@ -74,6 +74,9 @@ using Internals = test::SharedRingBufferInternalsForTest;
 // The same value as kStallTimeoutMs in trace_writer_v2_impl.cc.
 constexpr base::TimeMillis kStallTimeout{30000};
 
+// The same value as in trace_writer_v2_impl.cc.
+constexpr uint32_t kMaxUnreportedDroppedPackets = 128;
+
 // The fake time of the stall deadlines. Tests advance it in the endpoint's
 // DrainV2RingBuffer(), which a stalled writer calls before each wait. So the
 // deadline decisions do not depend on how long the real waits take.
@@ -541,6 +544,12 @@ TEST_F(TraceWriterV2ImplTest, StallDeadlineCoversAllRetries) {
 
   EXPECT_EQ(writer->drop_count(), 1u);
   EXPECT_EQ(num_drain_requests_, 3u);
+
+  // The ring buffer header has the three waits and their fake time.
+  const SharedRingBuffer::WriterStats stats =
+      reader_ring_buffer_->LoadWriterStatsRelaxed();
+  EXPECT_EQ(stats.stalls, 3u);
+  EXPECT_EQ(stats.stall_time_ms, static_cast<uint64_t>(kStallTimeout.count()));
 }
 
 // The same holds for the replacement acquisition of a relocation.
@@ -733,6 +742,11 @@ TEST_F(TraceWriterV2ImplTest, RelocationDropDiscardsPacketAndReportsLoss) {
     if (read.packet.for_testing().str() == "recovered")
       EXPECT_NE(read.previous_dropped, 0u);
   }
+
+  // The writer counted the packet that it dropped. The reader counted the
+  // packet that it discarded with the flagged chunk.
+  EXPECT_EQ(reader_ring_buffer_->LoadWriterStatsRelaxed().dropped_packets, 1u);
+  EXPECT_EQ(reader_->GetStats().data_loss_fragments, 1u);
 }
 
 // --- Counters ---
@@ -763,6 +777,48 @@ TEST_F(TraceWriterV2ImplTest, DropCountCountsEachLossOnce) {
   for (int i = 0; i < 8 && writer->drop_count() == 1; ++i)
     WritePacket(writer.get(), payload);
   EXPECT_EQ(writer->drop_count(), 2u);
+}
+
+// The writer counts every dropped packet in the ring buffer header, where the
+// service reads it for TraceStats. It adds them in batches, so that a writer
+// that drops every packet does not write to the shared header each time.
+TEST_F(TraceWriterV2ImplTest, DroppedPacketsReachRingBufferHeader) {
+  // Without a reader, kDrop does not wait and nothing frees space.
+  CreateRingBufferArbiter(/*num_chunks=*/4);
+  auto writer = CreateWriter(BufferExhaustedPolicy::kDrop);
+  auto dropped_packets_in_header = [this] {
+    return reader_ring_buffer_->LoadWriterStatsRelaxed().dropped_packets;
+  };
+  // Each 200-byte packet needs its own chunk.
+  const std::string payload(200, 'd');
+  for (int i = 0; i < 4; ++i)
+    WritePacket(writer.get(), payload);
+  ASSERT_EQ(writer->drop_count(), 0u);
+
+  // The ring buffer is full, so every packet is dropped. The header gets them
+  // when the batch is full.
+  for (uint32_t i = 1; i < kMaxUnreportedDroppedPackets; ++i)
+    WritePacket(writer.get(), payload);
+  EXPECT_EQ(dropped_packets_in_header(), 0u);
+  WritePacket(writer.get(), payload);
+  EXPECT_EQ(dropped_packets_in_header(), kMaxUnreportedDroppedPackets);
+
+  // Flush() adds a batch that is not full.
+  for (int i = 0; i < 3; ++i)
+    WritePacket(writer.get(), payload);
+  EXPECT_EQ(dropped_packets_in_header(), kMaxUnreportedDroppedPackets);
+  writer->Flush();
+  EXPECT_EQ(dropped_packets_in_header(), kMaxUnreportedDroppedPackets + 3);
+
+  // So does the next packet that fits, which ends the drop.
+  for (int i = 0; i < 2; ++i)
+    WritePacket(writer.get(), payload);
+  AttachReader();
+  Drain();
+  WritePacket(writer.get(), "fits");
+  EXPECT_EQ(dropped_packets_in_header(), kMaxUnreportedDroppedPackets + 5);
+  // All these packets are one drop for drop_count().
+  EXPECT_EQ(writer->drop_count(), 1u);
 }
 
 // written() counts the packet bytes in all fragments. It does not count

@@ -693,7 +693,7 @@ bool TraceBufferV2::ReadNextTracePacket(
           if (out_packet->size() == 0)
             continue;  // Skip empty fragments.
 
-          if (PERFETTO_UNLIKELY(!RewriteProtoGroupPacket(out_packet))) {
+          if (PERFETTO_UNLIKELY(!RewriteProtoGroupPacket(s, out_packet))) {
             out_packet->Clear();
             internal::AddSeqDataLoss(&s,
                                      DataLossReason::DATA_LOSS_CHUNK_CORRUPTED);
@@ -724,7 +724,8 @@ bool TraceBufferV2::ReadNextTracePacket(
   }  // for(;;)
 }
 
-bool TraceBufferV2::RewriteProtoGroupPacket(TracePacket* packet) {
+bool TraceBufferV2::RewriteProtoGroupPacket(const SequenceState& seq,
+                                            TracePacket* packet) {
   PERFETTO_DCHECK(packet->size() > 0);
 
   // The packet's slices point into TBChunks. The rewriter reads them in
@@ -742,6 +743,12 @@ bool TraceBufferV2::RewriteProtoGroupPacket(TracePacket* packet) {
       return true;
     case tracing_v2::RewriteResult::kMalformedInput:
       stats_.set_abi_violations(stats_.abi_violations() + 1);
+      // Keep the producer of the first one. It tells which app and SDK
+      // version encoded the packet.
+      if (stats_.malformed_packets_dropped() == 0)
+        stats_.set_first_malformed_packet_producer_id(seq.producer_id);
+      stats_.set_malformed_packets_dropped(stats_.malformed_packets_dropped() +
+                                           1);
       return false;
     case tracing_v2::RewriteResult::kGroupTooLarge:
       stats_.set_oversized_packets_dropped(stats_.oversized_packets_dropped() +
@@ -838,7 +845,8 @@ void TraceBufferV2::CopyChunkUntrusted(
   }
 
   auto seq_key = MkProducerAndWriterID(producer_id_trusted, writer_id);
-  writer_stats_.Insert(seq_key, static_cast<HistValue>(all_frags_size));
+  writer_stats_.Insert(seq_key, static_cast<HistValue>(all_frags_size),
+                       kProtocolAbiV1);
 
   auto [seq_it, seq_is_new] = sequences_.try_emplace(
       seq_key,
@@ -1124,7 +1132,8 @@ bool TraceBufferV2::CopyChunkV2Untrusted(
 
   auto seq_key =
       MkProducerAndWriterID(sequence.producer_id_trusted, sequence.writer_id);
-  writer_stats_.Insert(seq_key, static_cast<HistValue>(total_payload));
+  writer_stats_.Insert(seq_key, static_cast<HistValue>(total_payload),
+                       kProtocolAbiV2);
 
   auto [seq_it, seq_is_new] = sequences_.try_emplace(
       seq_key, SequenceState(sequence.producer_id_trusted, sequence.writer_id,
