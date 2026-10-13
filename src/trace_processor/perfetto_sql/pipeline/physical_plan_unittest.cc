@@ -233,18 +233,35 @@ TEST_F(PhysicalPlanTest, RowsAlreadyInOrderAreNotSortedAgain) {
     EXPECT_TRUE(lowered.ok()) << lowered.status().message();
     return lowered.ok() ? PhysicalPlanToString(**lowered) : "";
   };
-  // Rows sorted by (cpu, ts) are also sorted by cpu, but not by ts.
+  // Rows sorted by (cpu, ts) are also sorted by cpu. A sort that nothing
+  // depends on yet is dropped when the rows are sorted again.
   EXPECT_EQ(plan("FROM t |> ORDER BY cpu, ts |> ORDER BY cpu"),
             "main: DataframeScan | Sort(#2, #0)");
   EXPECT_EQ(plan("FROM t |> ORDER BY cpu, ts |> ORDER BY ts"),
-            "main: DataframeScan | Sort(#2, #0) | Sort(#0)");
-
-  // Grouping is stable, so rows sorted by ts only need grouping by cpu to be
-  // sorted by ts within each cpu. No second sort is needed.
-  EXPECT_EQ(plan("FROM t |> ORDER BY ts |> INTERVAL FLATTEN PER cpu "
+            "main: DataframeScan | Sort(#0)");
+  EXPECT_EQ(plan("FROM t |> ORDER BY cpu |> INTERVAL FLATTEN PER cpu "
                  "AGGREGATE COUNT(*) AS n"),
-            "main: DataframeScan | Sort(#0) | AssertType(#0 to Int64) | "
+            "main: DataframeScan | AssertType(#0 to Int64) | "
+            "AssertType(#1 to Int64) | GroupedSort(#2; #0) | "
+            "IntervalFlatten(#0, #1, keys: #2, groups: #3; COUNT(*))");
+
+  // The scan outputs rows sorted by ts. Grouping is stable, so grouping by
+  // cpu is enough to sort by ts within each cpu. No sort is needed.
+  Exec("CREATE TABLE by_ts(ts INTEGER, dur INTEGER, cpu INTEGER)");
+  Exec("INSERT INTO by_ts VALUES (0, 1, 1), (2, 1, 0), (5, 1, 1)");
+  EXPECT_EQ(plan("FROM by_ts |> INTERVAL FLATTEN PER cpu "
+                 "AGGREGATE COUNT(*) AS n"),
+            "main: DataframeScan | AssertType(#0 to Int64) | "
             "AssertType(#1 to Int64) | GroupedSort(#2) | "
+            "IntervalFlatten(#0, #1, keys: #2, groups: #3; COUNT(*))");
+  // The scan outputs rows grouped by cpu, so they only need group numbers,
+  // then a sort by group number and ts.
+  Exec("CREATE TABLE by_cpu(ts INTEGER, dur INTEGER, cpu INTEGER)");
+  Exec("INSERT INTO by_cpu VALUES (5, 1, 0), (0, 1, 0), (2, 1, 1)");
+  EXPECT_EQ(plan("FROM by_cpu |> INTERVAL FLATTEN PER cpu "
+                 "AGGREGATE COUNT(*) AS n"),
+            "main: DataframeScan | AssertType(#0 to Int64) | "
+            "AssertType(#1 to Int64) | NumberGroups(#2) | Sort(#3, #0) | "
             "IntervalFlatten(#0, #1, keys: #2, groups: #3; COUNT(*))");
 
   // Groups are output in the order first seen, so if the input is sorted by
@@ -272,14 +289,15 @@ TEST_F(PhysicalPlanTest, IntersectionOrdersItsOperands) {
       "|> SELECT ts, dur, p.cpu");
   ASSERT_TRUE(plan.ok()) << plan.status().message();
   // ts and dur are converted to Int64. So is cpu, because it has a different
-  // integer type in each dataframe.
+  // integer type in each dataframe. b's rows are sorted by cpu, so they are
+  // already grouped. They only get group numbers and a sort by number and ts.
   EXPECT_EQ(PhysicalPlanToString(**plan),
             "side: DataframeScan | AssertType(#0 to Int64) | "
             "AssertType(#1 to Int64) | AssertType(#2 to Int64) | "
             "GroupedSort(#2; #0)\n"
             "side: DataframeScan | AssertType(#0 to Int64) | "
             "AssertType(#1 to Int64) | AssertType(#2 to Int64) | "
-            "GroupedSort(#2; #0)\n"
+            "NumberGroups(#2) | Sort(#3, #0)\n"
             "main: IntervalIntersect(#0, #1, keys: #2, groups: #3; #0, #1, "
             "keys: #2, groups: #3)");
 }

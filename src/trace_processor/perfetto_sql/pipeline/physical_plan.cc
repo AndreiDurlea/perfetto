@@ -17,6 +17,7 @@
 #include "src/trace_processor/perfetto_sql/pipeline/physical_plan.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -31,6 +32,7 @@
 #include "src/trace_processor/core/common/storage_types.h"
 #include "src/trace_processor/core/exec/assert_type.h"
 #include "src/trace_processor/core/exec/grouped_sort.h"
+#include "src/trace_processor/core/exec/number_groups.h"
 #include "src/trace_processor/core/exec/sort.h"
 #include "src/trace_processor/core/exec/tree_number_nodes.h"
 #include "src/trace_processor/core/exec/tree_order.h"
@@ -115,6 +117,7 @@ void Lowering::SetSource(std::unique_ptr<core::exec::Source> source) {
 }
 
 void Lowering::AddOperator(core::exec::Pipeline::Step operation) {
+  open_sort_.reset();
   operators_.push_back(std::move(operation));
 }
 
@@ -168,6 +171,10 @@ void Lowering::RequireSorted(const std::vector<SortKey>& keys) {
   if (IsArranged({}, keys)) {
     return;
   }
+  DropOpenSort();
+  if (IsArranged({}, keys)) {
+    return;
+  }
   ex::SortSpec sort;
   for (const SortKey& key : keys) {
     if (!plan().columns()[key.column].type.storage()) {
@@ -175,12 +182,16 @@ void Lowering::RequireSorted(const std::vector<SortKey>& keys) {
     }
     sort.keys.push_back({QueryPosition(key.column), key.descending});
   }
-  AddOperator(std::make_unique<ex::Sort>(std::move(sort)));
+  AddSort(std::make_unique<ex::Sort>(std::move(sort)));
   arrangements_ = {{{}, keys}};
   tree_walk_.reset();
 }
 
 void Lowering::RequireGrouped(const std::vector<ColumnId>& keys) {
+  if (IsArranged(keys, {})) {
+    return;
+  }
+  DropOpenSort();
   if (!IsArranged(keys, {})) {
     GroupRows(keys, {});
   }
@@ -197,6 +208,26 @@ void Lowering::RequireSortedWithinGroups(
   if (IsArranged(keys, sorted_by)) {
     return;
   }
+  DropOpenSort();
+  if (IsArranged(keys, sorted_by)) {
+    return;
+  }
+  // If the rows are already grouped, sort by group number and then
+  // `sorted_by` instead of grouping again.
+  if (IsArranged(keys, {})) {
+    ex::SortSpec sort;
+    sort.keys.push_back({RequireGroupNumbers(keys), false});
+    for (const SortKey& key : sorted_by) {
+      if (!plan().columns()[key.column].type.storage()) {
+        RequireType(key.column, core::Int64{});
+      }
+      sort.keys.push_back({QueryPosition(key.column), key.descending});
+    }
+    AddSort(std::make_unique<ex::Sort>(std::move(sort)));
+    arrangements_ = {{keys, sorted_by}};
+    tree_walk_.reset();
+    return;
+  }
   // Grouping is stable, so if the rows are already sorted by `sorted_by`,
   // grouping them is enough.
   GroupRows(keys,
@@ -211,9 +242,14 @@ uint32_t Lowering::RequireGroupNumbers(const std::vector<ColumnId>& keys) {
       return numbers.position;
     }
   }
-  // The rows are grouped but have no group numbers. Grouping them again
-  // adds the numbers.
-  GroupRows(keys, {});
+  // The rows are grouped but have no group numbers. NumberGroups adds them
+  // by finding where the keys change.
+  std::vector<uint32_t> positions;
+  for (ColumnId key : keys) {
+    positions.push_back(QueryPosition(key));
+  }
+  AddOperator(std::make_unique<ex::NumberGroups>(std::move(positions)));
+  group_numbers_.push_back({keys, column_count_++});
   return group_numbers_.back().position;
 }
 
@@ -221,10 +257,14 @@ Lowering::TreeColumns Lowering::RequireTreeWalk(ColumnId node,
                                                 ColumnId parent,
                                                 TreeDirection direction) {
   if (!tree_columns_) {
-    AddOperator(std::make_unique<ex::TreeNumberNodes>(QueryPosition(node),
-                                                      QueryPosition(parent)));
+    AddOrderIndependent(std::make_unique<ex::TreeNumberNodes>(
+        QueryPosition(node), QueryPosition(parent)));
     tree_columns_ = TreeColumns{column_count_++, column_count_++};
   }
+  if (tree_walk_ == direction) {
+    return *tree_columns_;
+  }
+  DropOpenSort();
   if (tree_walk_ == direction) {
     return *tree_columns_;
   }
@@ -269,6 +309,7 @@ void Lowering::DeclareGroupNumbers(const std::vector<ColumnId>& keys,
 
 void Lowering::ResetLayout() {
   column_count_ = 0;
+  open_sort_.reset();
   arrangements_.clear();
   tree_walk_.reset();
   tree_columns_.reset();
@@ -345,6 +386,26 @@ bool Lowering::IsArranged(const std::vector<ColumnId>& keys,
   return false;
 }
 
+void Lowering::AddOrderIndependent(core::exec::Pipeline::Step step) {
+  operators_.push_back(std::move(step));
+}
+
+void Lowering::AddSort(core::exec::Pipeline::Step sort) {
+  open_sort_ = OpenSort{operators_.size(), arrangements_, tree_walk_};
+  operators_.push_back(std::move(sort));
+}
+
+void Lowering::DropOpenSort() {
+  if (!open_sort_) {
+    return;
+  }
+  operators_.erase(operators_.begin() +
+                   static_cast<ptrdiff_t>(open_sort_->index));
+  arrangements_ = std::move(open_sort_->arrangements);
+  tree_walk_ = open_sort_->tree_walk;
+  open_sort_.reset();
+}
+
 void Lowering::GroupRows(const std::vector<ColumnId>& keys,
                          const std::vector<SortKey>& sorted_by) {
   ex::GroupedSortSpec spec;
@@ -386,7 +447,7 @@ void Lowering::Convert(const Side& side, const PlanType& type) {
   plan.converted_[side.column] = *type.storage();
   uint32_t position = side.pipeline->QueryPosition(side.column);
   if (from.is_null()) {
-    side.pipeline->AddOperator(
+    side.pipeline->AddOrderIndependent(
         std::make_unique<ex::NullColumn>(position, *type.storage()));
     return;
   }
@@ -397,7 +458,7 @@ void Lowering::Convert(const Side& side, const PlanType& type) {
     target = core::Double{};
   }
   PERFETTO_DCHECK(target.Is<core::String>() == type.Is<core::String>());
-  side.pipeline->AddOperator(std::make_unique<ex::AssertType>(
+  side.pipeline->AddOrderIndependent(std::make_unique<ex::AssertType>(
       position, target, plan.plan().columns()[side.column].name));
 }
 
